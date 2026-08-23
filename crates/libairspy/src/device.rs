@@ -50,7 +50,8 @@ const FALLBACK_SAMPLERATES: [u32; 2] = [10_000_000, 2_500_000];
 
 /// Cap on the firmware-reported rate count: a control transfer's
 /// wLength is a `u16`, so more than `u16::MAX / 4` words cannot
-/// arrive in one read (C truncates the length cast instead).
+/// arrive in one read (`airspy_read_samplerates_from_fw` in airspy.c
+/// passes `count * sizeof(uint32_t)` through that cast, truncating).
 const MAX_SAMPLERATE_COUNT: u32 = (u16::MAX as u32) / 4;
 
 /// Decode little-endian `u32` sample rates from the bytes actually
