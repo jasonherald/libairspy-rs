@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev pkg-config
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Build (default features)
+        run: cargo build --workspace --locked
+
+      - name: Build (all features)
+        run: cargo build --workspace --all-features --locked
+
+      - name: Test (default features)
+        run: cargo test --workspace --locked
+
+      - name: Test (all features)
+        run: cargo test --workspace --all-features --locked
+
+  feature-matrix:
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [tokio, smol]
+    env:
+      # Hoist the matrix value into an env var so it never lands inside a run-command
+      # template expansion. matrix.* is workflow-defined (literal strings only — not
+      # attacker-controlled), but the env-var pattern is the safest convention to keep.
+      FEATURE: ${{ matrix.feature }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          key: feature-${{ matrix.feature }}
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev pkg-config
+
+      - name: Build (single feature)
+        run: cargo build -p libairspy-rs --locked --no-default-features --features "$FEATURE"
+
+      - name: Test (single feature)
+        run: cargo test -p libairspy-rs --locked --no-default-features --features "$FEATURE"
+
+  docs:
+    name: Docs (docs.rs config)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev pkg-config
+      - name: Build docs (all features, like docs.rs)
+        # Only libairspy-rs is published; airspy-tools never reaches docs.rs.
+        run: cargo doc -p libairspy-rs --all-features --no-deps --locked
+
+  msrv:
+    name: MSRV (1.95.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      # Pin the toolchain to the version declared in the workspace's
+      # `rust-version = "1.95"`. CI's default `stable` channel will keep
+      # advancing past this; without the pin a newer-rustc-only feature
+      # could land green and silently break consumers on 1.95.
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          key: msrv-1.95.0
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev pkg-config
+      - name: Build (all features, MSRV pin)
+        run: cargo build --workspace --all-features --locked
+
+  cross-platform:
+    name: Cross-platform build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          key: cross-${{ matrix.os }}
+
+      # libusb install is platform-specific. Linux is covered by the
+      # primary `check` job above; here we add the two other tier-1
+      # rustc targets so the "no C build dep, works everywhere" claim
+      # is actually validated.
+      - name: Install libusb (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libusb pkg-config
+
+      - name: Install libusb (Windows)
+        if: runner.os == 'Windows'
+        # vcpkg is preinstalled on `windows-latest`. Build the static
+        # x64-windows triplet so `libusb1-sys`'s build script picks it
+        # up via VCPKG_ROOT (also preset by the runner). The
+        # VCPKGRS_DYNAMIC=0 env on the cargo invocations below selects
+        # the static link path.
+        run: vcpkg install libusb:x64-windows-static-md
+        shell: bash
+
+      - name: Build (all features)
+        env:
+          # Set on every step so consumers reproducing locally see the
+          # invocation pattern; ignored by non-Windows builds.
+          VCPKGRS_DYNAMIC: 0
+        run: cargo build --workspace --all-features --locked
+
+      - name: Test (lib only — no hardware)
+        env:
+          VCPKGRS_DYNAMIC: 0
+        # `--lib` excludes integration tests in `tests/` (those are
+        # all `#[ignore]`-gated and need real hardware anyway). Doc
+        # tests run via `--doc` separately so any platform-specific
+        # codegen quirks surface in their own step.
+        run: cargo test --workspace --lib --all-features --locked
+
+      - name: Doctests (all features)
+        env:
+          VCPKGRS_DYNAMIC: 0
+        run: cargo test --workspace --doc --all-features --locked
+
+  # `cargo-deny` runs in its own dedicated workflow (`.github/workflows/deny.yml`)
+  # which adds a weekly cron on top of per-PR runs.

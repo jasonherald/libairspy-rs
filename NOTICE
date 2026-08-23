@@ -1,0 +1,35 @@
+libairspy-rs
+============
+
+This repository is a Rust port of airspyone_host, the C host support for
+Airspy software-defined radio receivers:
+https://github.com/airspy/airspyone_host
+
+Two components are ported, and each keeps its upstream license:
+
+libairspy (crates/libairspy, package `libairspy-rs`) — BSD-3-Clause,
+matching the upstream libairspy library:
+
+  Copyright (c) 2013, Michael Ossmann <mike@ossmann.com>
+  Copyright (c) 2012, Jared Boone <jared@sharebrained.com>
+  Copyright (c) 2014, Youssef Touil <youssef@airspy.com>
+  Copyright (c) 2014, Benjamin Vernoux <bvernoux@airspy.com>
+  Copyright (c) 2015, Ian Gilmour <ian@sdrsharp.com>
+
+airspy-tools (crates/airspy-tools) — GPL-2.0-or-later, matching the
+upstream airspy-tools utilities (based on the HackRF project):
+
+  Copyright 2012 Jared Boone <jared@sharebrained.com>
+  Copyright 2014-2015 Benjamin Vernoux <bvernoux@airspy.com>
+
+The USB vendor requests, register sequences, filter kernels, and magic
+constants in this repository are transcribed directly from the upstream
+C source; each crate is a derivative of the corresponding upstream
+component and is distributed under that component's license.
+
+  Copyright (C) 2026 Jason Herald <jason.herald@gmail.com>
+  and contributors to the libairspy-rs project
+  https://github.com/jasonherald/libairspy-rs
+
+See crates/libairspy/LICENSE and crates/airspy-tools/LICENSE for the
+full license texts.

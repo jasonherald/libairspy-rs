@@ -1,3 +1,7 @@
 /original/
 /target/
-Cargo.lock.orig
+Cargo.lock.bak
+.claude/
+.env
+*.swp
+.DS_Store

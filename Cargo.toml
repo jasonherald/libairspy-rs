@@ -1,0 +1,49 @@
+# Virtual workspace — the publishable library lives in crates/libairspy
+# (package `libairspy-rs`, BSD-3-Clause) and the CLI tools in
+# crates/airspy-tools (GPL-2.0-or-later, unpublished). The split exists
+# for the license boundary: it mirrors the upstream C tree, where
+# libairspy is BSD-3-Clause and airspy-tools are GPL.
+[workspace]
+resolver = "3"
+members = ["crates/libairspy", "crates/airspy-tools"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+repository = "https://github.com/jasonherald/libairspy-rs"
+
+[workspace.dependencies]
+# Internal
+libairspy-rs = { path = "crates/libairspy", version = "0.1.0" }
+
+# USB + core
+rusb = "0.9"
+thiserror = "2"
+tracing = "0.1"
+
+# Async-runtime integrations (optional, feature-gated in libairspy-rs;
+# same pattern as librtlsdr-rs)
+futures-core = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
+async-channel = "2"
+blocking = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow common patterns that pedantic flags unnecessarily
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Flag unwrap/panic in library code
+unwrap_used = "warn"
+panic = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

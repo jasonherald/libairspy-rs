@@ -1,0 +1,15 @@
+[package]
+name = "airspy-tools"
+version = "0.1.0"
+description = "Rust ports of the airspy-tools CLI utilities (airspy_info, airspy_rx, …)."
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+libairspy-rs.workspace = true
+
+[lints]
+workspace = true

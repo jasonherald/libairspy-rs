@@ -1,0 +1,43 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run weekly on Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # rustsec/audit-check compiles cargo-audit with the repo's active
+      # toolchain, and the rust-toolchain.toml MSRV pin (1.95.0) is older
+      # than what cargo-audit's dep tree requires (kstring 2.0.4 needs
+      # rustc 1.96+). Overriding to stable here only affects building the
+      # audit tool itself — the audit still checks our Cargo.lock.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      # No system deps needed: `cargo audit` only reads `Cargo.lock` against
+      # the rustsec advisory database — it doesn't compile the crate, so
+      # libusb-1.0-0-dev / pkg-config aren't required.
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
