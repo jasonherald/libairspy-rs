@@ -86,6 +86,28 @@ mod tests {
     }
 
     #[test]
+    fn unpacks_hardcoded_fixture_derived_from_c() {
+        // Independent of pack_group: words 0x12345678, 0x9ABCDEF0,
+        // 0x13579BDF pushed through the C expressions by hand —
+        //   s0=(w0>>20)&FFF=0x123      s1=(w0>>8)&FFF=0x456
+        //   s2=((w0&FF)<<4)|(w1>>28)=0x789
+        //   s3=(w1&0FFF0000)>>16=0xABC s4=(w1&FFF0)>>4=0xDEF
+        //   s5=((w1&F)<<8)|(w2>>24)=0x013
+        //   s6=(w2>>12)&FFF=0x579      s7=w2&FFF=0xBDF
+        let input: [u8; 12] = [
+            0x78, 0x56, 0x34, 0x12, // w0 LE
+            0xF0, 0xDE, 0xBC, 0x9A, // w1 LE
+            0xDF, 0x9B, 0x57, 0x13, // w2 LE
+        ];
+        let mut output = [0u16; 8];
+        assert_eq!(unpack_samples(&input, &mut output), 8);
+        assert_eq!(
+            output,
+            [0x123, 0x456, 0x789, 0xABC, 0xDEF, 0x013, 0x579, 0xBDF]
+        );
+    }
+
+    #[test]
     fn unpacks_multiple_groups_in_order() {
         let a = [1, 2, 3, 4, 5, 6, 7, 8];
         let b = [0xFFF, 0, 0xAAA, 0x555, 0x0F0, 0xF0F, 0x800, 0x7FF];
