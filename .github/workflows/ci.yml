@@ -213,7 +213,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libusb-1.0-0-dev pkg-config
       - name: Install cargo-llvm-cov
-        run: cargo install --locked cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov --version 0.8.5
       - name: Workspace coverage (LCOV)
         run: cargo llvm-cov --locked --workspace --all-features --lcov --output-path lcov.info
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
