@@ -16,6 +16,7 @@ pub mod board;
 pub mod commands;
 pub mod device;
 pub mod error;
+pub mod stream;
 mod transfer;
 
 pub use board::PartIdSerial;

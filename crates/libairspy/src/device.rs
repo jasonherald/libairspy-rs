@@ -8,8 +8,11 @@
 
 use rusb::UsbContext as _;
 
+use std::sync::Arc;
+
 use crate::commands::Command;
 use crate::error::{Error, Result};
+use crate::stream::StreamWorkers;
 
 /// USB vendor id (`airspy_usb_vid` in airspy.c).
 pub const AIRSPY_USB_VID: u16 = 0x1d50;
@@ -168,10 +171,20 @@ pub fn list_devices() -> Result<Vec<u64>> {
 ///
 /// Dropping the device releases the interface and closes the USB
 /// handle (`airspy_open_exit` semantics).
-#[derive(Debug)]
 pub struct Device {
-    handle: rusb::DeviceHandle<rusb::Context>,
+    handle: Arc<rusb::DeviceHandle<rusb::Context>>,
     supported_samplerates: Vec<u32>,
+    workers: Option<StreamWorkers>,
+}
+
+impl core::fmt::Debug for Device {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Device")
+            .field("handle", &self.handle)
+            .field("supported_samplerates", &self.supported_samplerates)
+            .field("streaming", &self.workers.is_some())
+            .finish()
+    }
 }
 
 impl Device {
@@ -208,8 +221,9 @@ impl Device {
                 continue;
             }
             let mut device = Self {
-                handle,
+                handle: Arc::new(handle),
                 supported_samplerates: Vec::new(),
+                workers: None,
             };
             // airspy_open_init caches the firmware rate table at open,
             // falling back to a fixed pair when the query fails.
@@ -264,6 +278,24 @@ impl Device {
         &self.handle
     }
 
+    /// Clone the shared USB handle for the reader thread.
+    pub(crate) fn usb_handle_arc(&self) -> Arc<rusb::DeviceHandle<rusb::Context>> {
+        Arc::clone(&self.handle)
+    }
+
+    /// Streaming worker accessors for `stream.rs`.
+    pub(crate) fn stream_workers(&self) -> Option<&StreamWorkers> {
+        self.workers.as_ref()
+    }
+
+    pub(crate) fn set_stream_workers(&mut self, workers: Option<StreamWorkers>) {
+        self.workers = workers;
+    }
+
+    pub(crate) fn take_stream_workers(&mut self) -> Option<StreamWorkers> {
+        self.workers.take()
+    }
+
     /// Kernel-driver detach + `set_configuration(1)` +
     /// `claim_interface(0)`, exactly as `airspy_open_device` does.
     fn configure(handle: &mut rusb::DeviceHandle<rusb::Context>) -> Result<()> {
@@ -279,8 +311,9 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // airspy_open_exit: libusb_release_interface(usb_device, 0)
-        // then close; rusb's own Drop handles the close/exit half.
+        // airspy_close stops streaming before airspy_open_exit
+        // releases interface 0; rusb's own Drop closes the handle.
+        let _ = self.stop_rx();
         let _ = self.handle.release_interface(USB_INTERFACE);
     }
 }
