@@ -1,0 +1,50 @@
+[package]
+name = "libairspy-rs"
+version = "0.1.0"
+description = "Pure-Rust port of libairspy — Airspy R2/Mini USB driver, no C library required."
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license = "BSD-3-Clause"
+homepage = "https://github.com/jasonherald/libairspy-rs"
+documentation = "https://docs.rs/libairspy-rs"
+readme = "README.md"
+keywords = ["sdr", "airspy", "radio", "iq", "usb"]
+categories = ["hardware-support", "science", "embedded"]
+
+# Files intentionally kept out of the published artifact: CI / dev-tool
+# config lives at the workspace root, so only crate-local extras need
+# excluding here.
+exclude = [
+    "/tests/data",
+]
+
+[dependencies]
+rusb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Async-runtime integrations are opt-in. Each runtime gets its own
+# feature flag so consumers pull in only what they use; the sync
+# callback / Iterator streaming paths need no features at all.
+futures-core = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-channel = { workspace = true, optional = true }
+blocking = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables the tokio-flavored async sample stream — a `Stream` impl
+# backed by `tokio::task::spawn_blocking` and `tokio::sync::mpsc`.
+tokio = ["dep:tokio", "dep:futures-core"]
+# Enables the smol-flavored async sample stream — same shape as the
+# tokio variant but using `blocking::unblock` and `async-channel`
+# (whose `Receiver` already implements `Stream`). No async-std
+# backend: async-std is unmaintained (RUSTSEC-2025-0052).
+smol = ["dep:blocking", "dep:async-channel", "dep:futures-core"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
