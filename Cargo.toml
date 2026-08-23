@@ -21,6 +21,9 @@ rusb = "0.9"
 thiserror = "2"
 tracing = "0.1"
 
+# CLI (airspy-tools)
+clap = { version = "4", features = ["derive"] }
+
 # Async-runtime integrations (optional, feature-gated in libairspy-rs;
 # same pattern as librtlsdr-rs)
 futures-core = "0.3"

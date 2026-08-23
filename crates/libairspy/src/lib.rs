@@ -21,3 +21,41 @@ mod transfer;
 pub use board::PartIdSerial;
 pub use device::{Device, list_devices};
 pub use error::{Error, Result};
+
+/// Library version, mirroring `airspy_lib_version` /
+/// `airspy_lib_version_t` — reporting this crate's own version rather
+/// than the C library's 1.0.12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LibVersion {
+    /// `major_version`
+    pub major: u32,
+    /// `minor_version`
+    pub minor: u32,
+    /// `revision`
+    pub revision: u32,
+}
+
+/// The version of this crate (`airspy_lib_version` semantics).
+#[must_use]
+pub fn lib_version() -> LibVersion {
+    let parse = |s: &str| s.parse().unwrap_or(0);
+    LibVersion {
+        major: parse(env!("CARGO_PKG_VERSION_MAJOR")),
+        minor: parse(env!("CARGO_PKG_VERSION_MINOR")),
+        revision: parse(env!("CARGO_PKG_VERSION_PATCH")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lib_version_matches_crate_version() {
+        let v = lib_version();
+        assert_eq!(
+            format!("{}.{}.{}", v.major, v.minor, v.revision),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+}
