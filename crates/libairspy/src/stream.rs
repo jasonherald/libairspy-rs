@@ -40,6 +40,10 @@ pub(crate) const BULK_ENDPOINT: u8 = 0x81;
 /// `struct timeval timeout = { 0, 500000 }` (airspy.c).
 pub(crate) const EVENT_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Bytes per raw sample word — `consumer_threadproc` computes
+/// `sample_count = buffer_size / 2` (airspy.c), one `uint16_t` each.
+const RAW_SAMPLE_BYTES: usize = 2;
+
 /// One delivered block of samples — the `airspy_transfer` view handed
 /// to the `airspy_start_rx` callback.
 ///
@@ -119,11 +123,13 @@ impl SampleQueue {
     pub(crate) fn acquire_free(&self) -> Option<Vec<u8>> {
         let mut s = self.state.lock().ok()?;
         loop {
-            if let Some(buf) = s.free.pop() {
-                return Some(buf);
-            }
+            // Shutdown wins over an available buffer so a stopping
+            // stream never starts another read.
             if s.shutdown {
                 return None;
+            }
+            if let Some(buf) = s.free.pop() {
+                return Some(buf);
             }
             s = self.cv.wait(s).ok()?;
         }
@@ -156,11 +162,14 @@ impl SampleQueue {
     pub(crate) fn pop_filled(&self) -> Option<(Vec<u8>, u32)> {
         let mut s = self.state.lock().ok()?;
         loop {
-            if let Some(entry) = s.filled.pop_front() {
-                return Some(entry);
-            }
+            // Shutdown wins over queued data: C's consumer discards
+            // undelivered buffers once streaming clears (the
+            // !streaming break in consumer_threadproc).
             if s.shutdown {
                 return None;
+            }
+            if let Some(entry) = s.filled.pop_front() {
+                return Some(entry);
             }
             s = self.cv.wait(s).ok()?;
         }
@@ -219,11 +228,17 @@ pub(crate) fn run_consumer(
 ) {
     // C computes dropped_samples as dropped_buffers * sample_count
     // where sample_count is the u16 count per buffer.
-    let sample_count = (BUFFER_SIZE / 2) as u64;
+    let sample_count = (BUFFER_SIZE / RAW_SAMPLE_BYTES) as u64;
     while shared.running() {
         let Some((buf, dropped)) = shared.queue.pop_filled() else {
             break;
         };
+        // A stop that raced the pop wins: recycle and exit without a
+        // post-stop callback.
+        if !shared.running() {
+            shared.queue.recycle(buf);
+            break;
+        }
         let keep_going = callback(Transfer {
             samples: &buf,
             dropped_samples: u64::from(dropped) * sample_count,
@@ -249,6 +264,11 @@ fn run_reader(shared: &StreamShared, handle: &rusb::DeviceHandle<rusb::Context>)
         let Some(mut buf) = shared.queue.acquire_free() else {
             break;
         };
+        // A stop that raced the acquisition wins: no further reads.
+        if !shared.running() {
+            shared.queue.recycle(buf);
+            break;
+        }
         match handle.read_bulk(BULK_ENDPOINT, &mut buf, EVENT_TIMEOUT) {
             // C requires actual_length == length; a short transfer
             // stops streaming.
