@@ -21,6 +21,9 @@ const SAMPLES_PER_GROUP: usize = 8;
 // Consumed by the sample-type pipeline (#12); until that lands the
 // unpacker has no callers outside its tests.
 #[allow(dead_code)]
+// Every assembled value is at most 12 bits ((0xFF << 4) | 0xF =
+// 0xFFF), but clippy cannot prove it through the shift-or pairs.
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn unpack_samples(input: &[u32], output: &mut [u16]) -> usize {
     let groups = core::cmp::min(
         input.len() / WORDS_PER_GROUP,
