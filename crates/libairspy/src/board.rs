@@ -30,15 +30,20 @@ impl PartIdSerial {
     /// `serial_no[0..4]`, each a little-endian `u32` (C applies
     /// `TO_LE` to every word).
     fn from_le_bytes(raw: &[u8; PARTID_SERIALNO_LEN]) -> Self {
-        let word = |i: usize| {
-            let bytes: [u8; 4] = raw[i * 4..i * 4 + 4]
-                .try_into()
-                .expect("4-byte chunk of a 24-byte array");
-            u32::from_le_bytes(bytes)
-        };
+        // Panic-free, zero-allocation decode: peel one 4-byte chunk per
+        // word. The `if let` always matches (24 = 6 × 4) but keeps
+        // every path non-panicking per the library rules.
+        let mut words = [0u32; 6];
+        let mut rest: &[u8] = raw;
+        for word in &mut words {
+            if let Some((chunk, tail)) = rest.split_first_chunk::<4>() {
+                *word = u32::from_le_bytes(*chunk);
+                rest = tail;
+            }
+        }
         Self {
-            part_id: [word(0), word(1)],
-            serial_no: [word(2), word(3), word(4), word(5)],
+            part_id: [words[0], words[1]],
+            serial_no: [words[2], words[3], words[4], words[5]],
         }
     }
 }
