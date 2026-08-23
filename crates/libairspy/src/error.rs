@@ -71,7 +71,10 @@ impl Error {
             Self::NotFound => "AIRSPY_ERROR_NOT_FOUND",
             Self::Busy => "AIRSPY_ERROR_BUSY",
             Self::NoMem => "AIRSPY_ERROR_NO_MEM",
-            Self::Unsupported => "AIRSPY_ERROR_UNSUPPORTED",
+            // AIRSPY_ERROR_UNSUPPORTED is missing from the C switch in
+            // airspy_error_name(), so C returns its default string; we
+            // replicate that for output parity with the C tools.
+            Self::Unsupported => "airspy unknown error",
             Self::Usb(_) => "AIRSPY_ERROR_LIBUSB",
             Self::Thread => "AIRSPY_ERROR_THREAD",
             Self::StreamingThread => "AIRSPY_ERROR_STREAMING_THREAD_ERR",
@@ -108,7 +111,10 @@ mod tests {
         assert_eq!(Error::NotFound.name(), "AIRSPY_ERROR_NOT_FOUND");
         assert_eq!(Error::Busy.name(), "AIRSPY_ERROR_BUSY");
         assert_eq!(Error::NoMem.name(), "AIRSPY_ERROR_NO_MEM");
-        assert_eq!(Error::Unsupported.name(), "AIRSPY_ERROR_UNSUPPORTED");
+        // AIRSPY_ERROR_UNSUPPORTED has no case in C's airspy_error_name()
+        // switch — it falls through to the default branch. C-exact means
+        // replicating that quirk.
+        assert_eq!(Error::Unsupported.name(), "airspy unknown error");
         assert_eq!(Error::Usb(rusb::Error::Io).name(), "AIRSPY_ERROR_LIBUSB");
         assert_eq!(Error::Thread.name(), "AIRSPY_ERROR_THREAD");
         assert_eq!(
