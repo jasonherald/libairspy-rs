@@ -54,16 +54,44 @@ fn parse_serial(descriptor: &str) -> Option<u64> {
     // C skips SERIAL_PREFIX_LEN raw bytes without validating their
     // content; `get` keeps that semantic while refusing (rather than
     // panicking) if byte 10 is not a character boundary.
-    let hex = descriptor.get(SERIAL_PREFIX_LEN..)?;
-    let digits: &str = hex
+    let tail = descriptor.get(SERIAL_PREFIX_LEN..)?;
+    strtoull_16(tail)
+}
+
+/// The `strtoull(start, &end, 16)` contract the C serial parse relies
+/// on: skip leading whitespace, accept one optional sign ('-' negates
+/// with unsigned wraparound), accept an optional `0x`/`0X` prefix when
+/// a hex digit follows it, then consume hex digits greedily. `None`
+/// iff no digit was consumed (C's `start == end` reject path).
+fn strtoull_16(s: &str) -> Option<u64> {
+    // C isspace(): space, \t, \n, \v, \f, \r — one char wider than
+    // Rust's is_ascii_whitespace(), which lacks vertical tab.
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0B', '\x0C', '\r']);
+    let (negative, s) = match s.strip_prefix(['+', '-']) {
+        Some(rest) => (s.starts_with('-'), rest),
+        None => (false, s),
+    };
+    // The prefix is consumed only when a hex digit follows; bare "0x"
+    // parses as the digit '0' with 'x' left unconsumed.
+    let s = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_hexdigit()) => rest,
+        _ => s,
+    };
+    let digits: &str = s
         .find(|c: char| !c.is_ascii_hexdigit())
-        .map_or(hex, |end| &hex[..end]);
+        .map_or(s, |end| &s[..end]);
     if digits.is_empty() {
         return None;
     }
-    // At most 16 hex digits fit in the 26-char descriptor, so this
-    // cannot overflow u64.
-    u64::from_str_radix(digits, 16).ok()
+    // At most 16 hex digits fit in the 26-char descriptor, so the
+    // parse cannot overflow u64 (strtoull would saturate; unreachable
+    // at this input length).
+    let value = u64::from_str_radix(digits, 16).ok()?;
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
 }
 
 /// Read and parse the serial descriptor of an open handle. `None`
@@ -221,6 +249,56 @@ mod tests {
         // C rejects only when strtoull consumed nothing
         // (serial == 0 && start == end).
         assert_eq!(parse_serial("AIRSPY SN:ZZZZZZZZZZZZZZZZ"), None);
+        // Whitespace alone consumes no digits either.
+        assert_eq!(parse_serial("AIRSPY SN:                "), None);
+        // A sign with no digits after it consumes nothing.
+        assert_eq!(parse_serial("AIRSPY SN:-ZZZZZZZZZZZZZZZ"), None);
+    }
+
+    #[test]
+    fn skips_leading_whitespace_like_strtoull() {
+        assert_eq!(
+            parse_serial("AIRSPY SN:  123456789ABCDE"),
+            Some(0x12_3456_789A_BCDE)
+        );
+        assert_eq!(
+            parse_serial("AIRSPY SN:\t 123456789ABCDE"),
+            Some(0x12_3456_789A_BCDE)
+        );
+        // C isspace() includes vertical tab, which Rust's
+        // is_ascii_whitespace() does not.
+        assert_eq!(
+            parse_serial("AIRSPY SN:\x0B 123456789ABCDE"),
+            Some(0x12_3456_789A_BCDE)
+        );
+    }
+
+    #[test]
+    fn accepts_sign_like_strtoull() {
+        assert_eq!(
+            parse_serial("AIRSPY SN:+123456789ABCDEF"),
+            Some(0x123_4567_89AB_CDEF)
+        );
+        // strtoull negates on '-' with unsigned wraparound.
+        assert_eq!(
+            parse_serial("AIRSPY SN:-1ZZZZZZZZZZZZZZ"),
+            Some(1u64.wrapping_neg())
+        );
+    }
+
+    #[test]
+    fn accepts_hex_prefix_like_strtoull() {
+        assert_eq!(
+            parse_serial("AIRSPY SN:0x123456789ABCDE"),
+            Some(0x12_3456_789A_BCDE)
+        );
+        assert_eq!(
+            parse_serial("AIRSPY SN:0X123456789ABCDE"),
+            Some(0x12_3456_789A_BCDE)
+        );
+        // "0x" not followed by a hex digit: strtoull consumes just the
+        // "0" and stops, yielding 0 with digits consumed (accepted).
+        assert_eq!(parse_serial("AIRSPY SN:0xZZZZZZZZZZZZZZ"), Some(0));
     }
 
     #[test]
