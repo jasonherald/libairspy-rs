@@ -48,12 +48,18 @@ const fn serial_filter(serial_number: u64) -> Option<u64> {
 /// through `strtoull(_, _, 16)` — parsing stops at the first non-hex
 /// character and fails only when no digit was consumed at all.
 fn parse_serial(descriptor: &str) -> Option<u64> {
-    if descriptor.len() != SERIAL_EXPECTED_LEN {
+    if descriptor.len() < SERIAL_EXPECTED_LEN {
         return None;
     }
+    // C reads through libusb_get_string_descriptor_ascii into a
+    // 27-byte buffer, which writes at most 26 chars — an over-long
+    // descriptor arrives truncated to exactly SERIAL_EXPECTED_LEN and
+    // is accepted. rusb returns the full string, so truncate to match.
+    // `get` refuses (rather than panicking) if a cut lands off a
+    // character boundary; the descriptor is ASCII in practice.
+    let descriptor = descriptor.get(..SERIAL_EXPECTED_LEN)?;
     // C skips SERIAL_PREFIX_LEN raw bytes without validating their
-    // content; `get` keeps that semantic while refusing (rather than
-    // panicking) if byte 10 is not a character boundary.
+    // content.
     let tail = descriptor.get(SERIAL_PREFIX_LEN..)?;
     strtoull_16(tail)
 }
@@ -236,12 +242,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_serial_with_wrong_length() {
+    fn rejects_serial_shorter_than_expected() {
         // C checks serial_number_len == SERIAL_AIRSPY_EXPECTED_SIZE
-        // before parsing at all.
+        // after a read that cannot exceed it, so short reads reject.
         assert_eq!(parse_serial("AIRSPY SN:123"), None);
         assert_eq!(parse_serial(""), None);
-        assert_eq!(parse_serial("AIRSPY SN:0123456789ABCDEF0"), None);
+    }
+
+    #[test]
+    fn truncates_overlong_serial_like_c_buffer() {
+        // libusb_get_string_descriptor_ascii writes at most 26 chars
+        // into C's buffer, so a longer descriptor is truncated to 26
+        // and accepted; rusb returns the whole string and we must
+        // truncate to match.
+        assert_eq!(
+            parse_serial("AIRSPY SN:0123456789ABCDEF0"),
+            Some(0x0123_4567_89AB_CDEF)
+        );
+        assert_eq!(
+            parse_serial("AIRSPY SN:0123456789ABCDEF-EXTRA-JUNK"),
+            Some(0x0123_4567_89AB_CDEF)
+        );
     }
 
     #[test]
