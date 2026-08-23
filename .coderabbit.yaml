@@ -1,0 +1,93 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+tone_instructions: "Professional, concise. Prioritize idiomatic Rust and faithful-port correctness. USB driver + DSP crate — flag command/register mismatches vs the C libairspy source, hot-path allocations, thread-safety and numerical accuracy issues."
+
+reviews:
+  profile: "assertive"
+  high_level_summary: true
+  sequence_diagrams: false
+  poem: false
+  collapse_walkthrough: false
+  changed_files_summary: true
+
+  path_filters:
+    - "!target/**"
+    - "!original/**"
+    - "!test-data/**"
+
+  path_instructions:
+    - path: "crates/libairspy/**"
+      instructions: |
+        Pure-Rust port of libairspy (BSD-3-Clause). This is a FAITHFUL
+        port — the C source is the specification. Verify:
+        - Vendor-request bytes, wValue/wIndex packing, endpoint numbers,
+          timeouts, and transfer sizes match airspyone_host's airspy.c
+          and airspy_commands.h exactly
+        - Enum discriminants (error codes, commands, board ids, sample
+          types, GPIO ports/pins) are wire-compatible with the C enums
+        - Streaming engine: no data races, stop semantics can't deadlock
+          or lose the final callback, is_streaming transitions match C
+        - No allocations in hot paths (sample unpacking, IQ conversion,
+          transfer callbacks) after construction
+        - IQ converter arithmetic: int16 path must be bit-exact vs C
+          (shifts, rounding, saturation); float32 path within documented
+          tolerance; filter state persistence and reset semantics match
+        - Error types use thiserror (never anyhow in library code)
+        - Use tracing for logging, never println!/eprintln!
+        - No unwrap()/expect()/panic! in library code
+        - Public API is documented (crate denies missing_docs warnings)
+    - path: "crates/airspy-tools/**"
+      instructions: |
+        CLI ports of airspy-tools (GPL-2.0-or-later). Verify:
+        - Output format stays diffable against the corresponding C tool
+        - clap arg definitions mirror the original getopt flags
+        - Destructive operations (SPI flash erase/write, calibration
+          writes) require explicit confirmation or an explicit flag
+        - Binaries may use anyhow at the top level; shared helper code
+          follows the library rules
+    - path: "crates/**"
+      instructions: |
+        General rules for all crates:
+        - Named constants for magic numbers, with a comment pointing at
+          the C source location they were transcribed from
+        - Tests at file bottom in #[cfg(test)] mod tests
+        - unsafe_code is denied workspace-wide; any exception must be
+          narrowly scoped and documented
+    - path: ".github/workflows/**"
+      instructions: |
+        - Actions pinned by full commit SHA
+        - Least-privilege permissions blocks; persist-credentials: false
+          on checkouts
+        - Job names feeding required status checks (Check & Lint, Docs
+          (docs.rs config), Feature combinations, Dependency Audit,
+          License & Supply Chain Check) must not be renamed without
+          updating the branch ruleset
+
+  tools:
+    clippy:
+      enabled: true
+    gitleaks:
+      enabled: true
+    markdownlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    actionlint:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: "local"
+  issues:
+    scope: "local"
+  pull_requests:
+    scope: "local"
+  web_search:
+    enabled: true
+  code_guidelines:
+    enabled: true
