@@ -361,11 +361,14 @@ mod tests {
 
     #[test]
     fn open_with_unknown_serial_reports_not_found() {
-        // No real Airspy can carry this serial (parsed serials are at
-        // most 16 hex digits read from a fixed-format descriptor; this
-        // value is reserved by the test).
+        // Pick a nonzero serial provably absent from the attached
+        // device set, so the test holds even with hardware plugged in.
+        let serials = list_devices().expect("USB enumeration should succeed");
+        let unknown_serial = (1..=u64::MAX)
+            .find(|serial| !serials.contains(serial))
+            .expect("a finite device list cannot contain every nonzero u64");
         assert!(matches!(
-            Device::open_serial(0xDEAD_BEEF_DEAD_BEEF),
+            Device::open_serial(unknown_serial),
             Err(crate::Error::NotFound)
         ));
     }
