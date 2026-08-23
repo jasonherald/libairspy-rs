@@ -21,9 +21,6 @@ const SAMPLES_PER_GROUP: usize = 8;
 /// `sample_count` that is not a multiple of 8 (262144-byte buffers
 /// give 174762) and overruns both buffers on the final partial group
 /// — an upstream out-of-bounds this port does not reproduce.
-// Consumed by the sample-type pipeline (#12); until that lands the
-// unpacker has no callers outside its tests.
-#[allow(dead_code)]
 // Every assembled value is at most 12 bits ((0xFF << 4) | 0xF =
 // 0xFFF), but clippy cannot prove it through the shift-or pairs.
 #[allow(clippy::cast_possible_truncation)]
@@ -57,6 +54,110 @@ pub(crate) fn unpack_samples(input: &[u8], output: &mut [u16]) -> usize {
         samples[7] = (w2 & 0xFFF) as u16;
     }
     groups * SAMPLES_PER_GROUP
+}
+
+use crate::commands::SampleType;
+
+/// `SAMPLE_SHIFT` (airspy.c): `SAMPLE_ENCAPSULATION (16) -
+/// SAMPLE_RESOLUTION (12)`.
+const SAMPLE_SHIFT: i32 = 4;
+
+/// `SAMPLE_SCALE` (airspy.c): `1.0f / (1 << (15 - SAMPLE_SHIFT))`.
+const SAMPLE_SCALE: f32 = 1.0 / 2048.0;
+
+/// `convert_samples_int16` (airspy.c): `(src - 2048) << SAMPLE_SHIFT`,
+/// computed in `int` and stored as `int16_t`.
+// Truncation is the C cast: the shifted value spans -32768..32752.
+#[allow(clippy::cast_possible_truncation)]
+fn convert_samples_int16(src: &[u16], dest: &mut [i16]) {
+    for (s, d) in src.iter().zip(dest.iter_mut()) {
+        *d = ((i32::from(*s) - 2048) << SAMPLE_SHIFT) as i16;
+    }
+}
+
+/// `convert_samples_float` (airspy.c): `(src - 2048) * SAMPLE_SCALE`.
+#[allow(clippy::cast_precision_loss)]
+fn convert_samples_float(src: &[u16], dest: &mut [f32]) {
+    for (s, d) in src.iter().zip(dest.iter_mut()) {
+        *d = (i32::from(*s) - 2048) as f32 * SAMPLE_SCALE;
+    }
+}
+
+/// One block of delivered samples in the format selected via
+/// [`SampleType`] — the typed face of C's `airspy_transfer.samples`
+/// `void*`.
+#[derive(Debug)]
+pub enum Samples<'a> {
+    /// `AIRSPY_SAMPLE_FLOAT32_REAL` (and, with the DSP milestone,
+    /// `FLOAT32_IQ`).
+    Float32(&'a [f32]),
+    /// `AIRSPY_SAMPLE_INT16_REAL` (and, with the DSP milestone,
+    /// `INT16_IQ`).
+    Int16(&'a [i16]),
+    /// `AIRSPY_SAMPLE_UINT16_REAL` — raw ADC words.
+    Uint16(&'a [u16]),
+    /// `AIRSPY_SAMPLE_RAW` — the untouched bulk bytes.
+    Raw(&'a [u8]),
+}
+
+/// Reusable consumer-thread buffers — C's `unpacked_samples` and
+/// `output_buffer`, allocated once and recycled per block.
+#[derive(Debug, Default)]
+pub(crate) struct Scratch {
+    unpacked: Vec<u16>,
+    words: Vec<u16>,
+    out_i16: Vec<i16>,
+    out_f32: Vec<f32>,
+}
+
+/// The sample-type dispatch from `consumer_threadproc` (airspy.c):
+/// optional 12-bit unpack, then per-type conversion. Returns the
+/// typed samples plus the sample count C would report for the block.
+///
+/// The IQ types are absent until the DSP converters land (the
+/// streaming engine rejects them at `start_rx`).
+pub(crate) fn convert_block<'a>(
+    sample_type: SampleType,
+    packing_enabled: bool,
+    bytes: &'a [u8],
+    scratch: &'a mut Scratch,
+) -> (Samples<'a>, usize) {
+    // C: packing_enabled && sample_type != RAW → unpack first.
+    let words: &[u16] = if packing_enabled && sample_type != SampleType::Raw {
+        let max = bytes.len() / BYTES_PER_GROUP * SAMPLES_PER_GROUP;
+        scratch.unpacked.resize(max, 0);
+        let n = unpack_samples(bytes, &mut scratch.unpacked);
+        &scratch.unpacked[..n]
+    } else {
+        // Unpacked mode: the byte stream is little-endian u16 words
+        // (C casts the buffer; we copy into the reusable scratch).
+        scratch.words.clear();
+        scratch.words.extend(
+            bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]])),
+        );
+        &scratch.words
+    };
+    match sample_type {
+        // IQ conversion arrives with the DSP milestone; start_rx
+        // refuses these types until then, so this arm is unreachable
+        // in practice and degrades to RAW delivery.
+        SampleType::Raw | SampleType::Float32Iq | SampleType::Int16Iq => {
+            (Samples::Raw(bytes), bytes.len() / 2)
+        }
+        SampleType::Uint16Real => (Samples::Uint16(words), words.len()),
+        SampleType::Int16Real => {
+            scratch.out_i16.resize(words.len(), 0);
+            convert_samples_int16(words, &mut scratch.out_i16);
+            (Samples::Int16(&scratch.out_i16), words.len())
+        }
+        SampleType::Float32Real => {
+            scratch.out_f32.resize(words.len(), 0.0);
+            convert_samples_float(words, &mut scratch.out_f32);
+            (Samples::Float32(&scratch.out_f32), words.len())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +260,105 @@ mod tests {
         let mut output = [0xBEEF_u16; 8];
         unpack_samples(&[0u8; 12], &mut output);
         assert_eq!(output, [0u16; 8]);
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+    use crate::commands::SampleType;
+
+    #[test]
+    fn scale_and_shift_match_c() {
+        // SAMPLE_SHIFT = 16 - 12 = 4; SAMPLE_SCALE = 1/(1 << 11).
+        assert_eq!(SAMPLE_SHIFT, 4);
+        assert!((SAMPLE_SCALE - 1.0 / 2048.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn int16_conversion_matches_c_arithmetic() {
+        // C: dest = (src - 2048) << 4, computed in int then stored i16.
+        let src = [0u16, 2048, 4095, 2049];
+        let mut dest = [0i16; 4];
+        convert_samples_int16(&src, &mut dest);
+        assert_eq!(dest, [-32768, 0, 32752, 16]);
+    }
+
+    #[test]
+    fn float_conversion_matches_c_arithmetic() {
+        // C: dest = (src - 2048) * (1/2048.0f).
+        let src = [0u16, 2048, 4095];
+        let mut dest = [0f32; 3];
+        convert_samples_float(&src, &mut dest);
+        assert!((dest[0] + 1.0).abs() < f32::EPSILON);
+        assert!(dest[1].abs() < f32::EPSILON);
+        assert!((dest[2] - 2047.0 / 2048.0).abs() < f32::EPSILON);
+    }
+
+    fn le_bytes(words: &[u16]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn dispatch_raw_passes_bytes_through() {
+        let bytes = [1u8, 2, 3, 4];
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Raw, false, &bytes, &mut scratch);
+        assert!(matches!(samples, Samples::Raw(b) if b == bytes));
+        assert_eq!(count, 2); // buffer_size / 2 semantics: u16 count
+    }
+
+    #[test]
+    fn dispatch_uint16_real_yields_u16_words() {
+        let bytes = le_bytes(&[100, 4095, 0, 2048]);
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Uint16Real, false, &bytes, &mut scratch);
+        assert_eq!(count, 4);
+        assert!(matches!(samples, Samples::Uint16(w) if w == [100, 4095, 0, 2048]));
+    }
+
+    #[test]
+    fn dispatch_int16_real_converts() {
+        let bytes = le_bytes(&[0, 2048, 4095, 2049]);
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Int16Real, false, &bytes, &mut scratch);
+        assert_eq!(count, 4);
+        assert!(matches!(samples, Samples::Int16(w) if w == [-32768, 0, 32752, 16]));
+    }
+
+    #[test]
+    fn dispatch_float32_real_converts() {
+        let bytes = le_bytes(&[2048, 0]);
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Float32Real, false, &bytes, &mut scratch);
+        assert_eq!(count, 2);
+        let Samples::Float32(w) = samples else {
+            unreachable!("expected float samples");
+        };
+        assert!(w[0].abs() < f32::EPSILON);
+        assert!((w[1] + 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dispatch_unpacks_before_converting_when_packing_enabled() {
+        // consumer_threadproc: packing_enabled && type != RAW → unpack
+        // first. One packed group of 2048s converts to eight zeros.
+        let packed: Vec<u8> = {
+            let s: Vec<u32> = std::iter::repeat_n(2048u32, 8).collect();
+            let words = [
+                (s[0] << 20) | (s[1] << 8) | (s[2] >> 4),
+                ((s[2] & 0xF) << 28) | (s[3] << 16) | (s[4] << 4) | (s[5] >> 8),
+                ((s[5] & 0xFF) << 24) | (s[6] << 12) | s[7],
+            ];
+            words.iter().flat_map(|w| w.to_le_bytes()).collect()
+        };
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Int16Real, true, &packed, &mut scratch);
+        assert_eq!(count, 8);
+        assert!(matches!(samples, Samples::Int16(w) if w == [0i16; 8]));
+
+        // RAW skips the unpack even in packed mode.
+        let (samples, _) = convert_block(SampleType::Raw, true, &packed, &mut scratch);
+        assert!(matches!(samples, Samples::Raw(b) if b == packed.as_slice()));
     }
 }

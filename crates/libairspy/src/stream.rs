@@ -21,7 +21,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::commands::{Command, ReceiverMode};
+use crate::commands::{Command, ReceiverMode, SampleType};
+use crate::conversion::{Samples, Scratch, convert_block};
 use crate::device::Device;
 use crate::error::{Error, Result};
 
@@ -40,19 +41,15 @@ pub(crate) const BULK_ENDPOINT: u8 = 0x81;
 /// `struct timeval timeout = { 0, 500000 }` (airspy.c).
 pub(crate) const EVENT_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Bytes per raw sample word — `consumer_threadproc` computes
-/// `sample_count = buffer_size / 2` (airspy.c), one `uint16_t` each.
-const RAW_SAMPLE_BYTES: usize = 2;
-
 /// One delivered block of samples — the `airspy_transfer` view handed
 /// to the `airspy_start_rx` callback.
-///
-/// Until the sample-type pipeline lands, `samples` carries the raw
-/// bulk bytes (`AIRSPY_SAMPLE_RAW` semantics).
 #[derive(Debug)]
 pub struct Transfer<'a> {
-    /// Raw sample bytes for this block.
-    pub samples: &'a [u8],
+    /// Samples in the format selected before `start_rx`
+    /// (`airspy_transfer.samples` + `sample_type`).
+    pub samples: Samples<'a>,
+    /// The latched sample type for this stream.
+    pub sample_type: SampleType,
     /// `dropped_buffers * sample_count` — samples lost to a full ring
     /// since the previous delivery (`airspy_transfer.dropped_samples`).
     pub dropped_samples: u64,
@@ -219,16 +216,16 @@ impl StreamShared {
     }
 }
 
-/// `consumer_threadproc`: pop filled buffers, hand them to the
-/// callback, recycle. A `false` return stops streaming. Sample-type
-/// conversion slots in here when the pipeline lands.
+/// `consumer_threadproc`: pop filled buffers, run the sample-type
+/// dispatch, hand the typed block to the callback, recycle. A `false`
+/// return stops streaming.
 pub(crate) fn run_consumer(
     shared: &StreamShared,
+    sample_type: SampleType,
+    packing_enabled: bool,
     callback: &mut (impl FnMut(Transfer<'_>) -> bool + ?Sized),
 ) {
-    // C computes dropped_samples as dropped_buffers * sample_count
-    // where sample_count is the u16 count per buffer.
-    let sample_count = (BUFFER_SIZE / RAW_SAMPLE_BYTES) as u64;
+    let mut scratch = Scratch::default();
     while shared.running() {
         let Some((buf, dropped)) = shared.queue.pop_filled() else {
             break;
@@ -239,9 +236,14 @@ pub(crate) fn run_consumer(
             shared.queue.recycle(buf);
             break;
         }
+        let (samples, sample_count) =
+            convert_block(sample_type, packing_enabled, &buf, &mut scratch);
+        // C: dropped_samples = dropped_buffers * sample_count, with
+        // the block's own converted count.
         let keep_going = callback(Transfer {
-            samples: &buf,
-            dropped_samples: u64::from(dropped) * sample_count,
+            samples,
+            sample_type,
+            dropped_samples: u64::from(dropped) * sample_count as u64,
         });
         shared.queue.recycle(buf);
         if !keep_going {
@@ -321,12 +323,22 @@ impl Device {
     /// bulk endpoint halt, receiver on, then spawn the reader and
     /// consumer threads. Returns [`Error::Busy`] while streaming.
     ///
+    /// The sample type and packing mode are latched here (see
+    /// [`Device::set_sample_type`]). The IQ sample types return
+    /// [`Error::Unsupported`] until the DSP converters land.
+    ///
     /// The callback runs on the consumer thread; return `true` to
     /// keep streaming, `false` to stop (C's nonzero-return stop).
     pub fn start_rx(
         &mut self,
         callback: impl FnMut(Transfer<'_>) -> bool + Send + 'static,
     ) -> Result<()> {
+        let sample_type = self.sample_type();
+        if matches!(sample_type, SampleType::Float32Iq | SampleType::Int16Iq) {
+            // Temporary until the iqconverter ports land (M3).
+            return Err(Error::Unsupported);
+        }
+        let packing_enabled = self.packing_enabled;
         // C gates on `streaming || stop_requested` only, so a device
         // whose callback stopped the stream can be restarted; reap
         // finished workers before the busy check.
@@ -357,7 +369,7 @@ impl Device {
         let mut cb = callback;
         let consumer_spawn = std::thread::Builder::new()
             .name("airspy-consumer".into())
-            .spawn(move || run_consumer(&consumer_shared, &mut cb));
+            .spawn(move || run_consumer(&consumer_shared, sample_type, packing_enabled, &mut cb));
         let Ok(consumer) = consumer_spawn else {
             // Hardening beyond C (which leaves the receiver running
             // until stop/close after a thread-create failure): switch
@@ -553,10 +565,18 @@ mod tests {
         let mut seen = Vec::new();
         let shared2 = Arc::clone(&shared);
         let consumer = std::thread::spawn(move || {
-            run_consumer(&shared2, &mut |transfer: Transfer<'_>| {
-                seen.push((transfer.samples[0], transfer.dropped_samples));
-                seen.len() < 2 // stop after the second delivery
-            });
+            run_consumer(
+                &shared2,
+                SampleType::Raw,
+                false,
+                &mut |transfer: Transfer<'_>| {
+                    let Samples::Raw(bytes) = transfer.samples else {
+                        unreachable!("RAW stream delivers raw bytes");
+                    };
+                    seen.push((bytes[0], transfer.dropped_samples));
+                    seen.len() < 2 // stop after the second delivery
+                },
+            );
             seen
         });
 

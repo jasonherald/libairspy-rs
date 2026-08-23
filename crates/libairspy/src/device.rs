@@ -10,7 +10,7 @@ use rusb::UsbContext as _;
 
 use std::sync::Arc;
 
-use crate::commands::Command;
+use crate::commands::{Command, SampleType};
 use crate::error::{Error, Result};
 use crate::stream::StreamWorkers;
 
@@ -175,6 +175,9 @@ pub struct Device {
     handle: Arc<rusb::DeviceHandle<rusb::Context>>,
     supported_samplerates: Vec<u32>,
     workers: Option<StreamWorkers>,
+    sample_type: SampleType,
+    /// `device->packing_enabled` — toggled by the packing setter (M4).
+    pub(crate) packing_enabled: bool,
 }
 
 impl core::fmt::Debug for Device {
@@ -228,6 +231,10 @@ impl Device {
                 handle: Arc::new(handle),
                 supported_samplerates: Vec::new(),
                 workers: None,
+                // airspy_open_init: sample_type = AIRSPY_SAMPLE_FLOAT32_IQ,
+                // packing_enabled = false.
+                sample_type: SampleType::Float32Iq,
+                packing_enabled: false,
             };
             // airspy_open_init caches the firmware rate table at open,
             // falling back to a fixed pair when the query fails.
@@ -285,6 +292,21 @@ impl Device {
     /// Clone the shared USB handle for the reader thread.
     pub(crate) fn usb_handle_arc(&self) -> Arc<rusb::DeviceHandle<rusb::Context>> {
         Arc::clone(&self.handle)
+    }
+
+    /// Select the delivered sample format (`airspy_set_sample_type`).
+    ///
+    /// C assigns unconditionally and its consumer reads the field per
+    /// buffer (racing any mid-stream change); this port latches the
+    /// type when [`Device::start_rx`] runs — set it before starting.
+    pub fn set_sample_type(&mut self, sample_type: SampleType) {
+        self.sample_type = sample_type;
+    }
+
+    /// The currently selected sample format.
+    #[must_use]
+    pub fn sample_type(&self) -> SampleType {
+        self.sample_type
     }
 
     /// Streaming worker accessors for `stream.rs`.

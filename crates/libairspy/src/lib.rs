@@ -14,13 +14,14 @@
 
 pub mod board;
 pub mod commands;
-mod conversion;
+pub mod conversion;
 pub mod device;
 pub mod error;
 pub mod stream;
 mod transfer;
 
 pub use board::PartIdSerial;
+pub use conversion::Samples;
 pub use device::{Device, list_devices};
 pub use error::{Error, Result};
 
