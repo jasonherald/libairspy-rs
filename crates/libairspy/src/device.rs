@@ -15,13 +15,14 @@ pub const AIRSPY_USB_VID: u16 = 0x1d50;
 /// USB product id (`airspy_usb_pid` in airspy.c).
 pub const AIRSPY_USB_PID: u16 = 0x60a1;
 
-/// `STR_PREFIX_SERIAL_AIRSPY_SIZE` — chars before the hex digits
-/// ("AIRSPY SN:").
+/// `STR_PREFIX_SERIAL_AIRSPY_SIZE` in airspy.c — chars before the hex
+/// digits ("AIRSPY SN:").
 const SERIAL_PREFIX_LEN: usize = 10;
-/// `SERIAL_AIRSPY_EXPECTED_SIZE` — total serial-descriptor length.
+/// `SERIAL_AIRSPY_EXPECTED_SIZE` in airspy.c — total serial-descriptor
+/// length.
 const SERIAL_EXPECTED_LEN: usize = 26;
-/// `SERIAL_NUMBER_UNUSED` — `airspy_open_sn` treats serial 0 as "no
-/// filter" and opens the first device found.
+/// `SERIAL_NUMBER_UNUSED` in airspy.c — `airspy_open_sn` treats serial
+/// 0 as "no filter" and opens the first device found.
 const SERIAL_NUMBER_UNUSED: u64 = 0;
 
 /// USB configuration selected on open (`libusb_set_configuration(dev_handle, 1)`
