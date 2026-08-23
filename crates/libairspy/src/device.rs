@@ -191,6 +191,12 @@ impl Device {
         Err(Error::NotFound)
     }
 
+    /// Borrow the underlying USB handle; the vendor-request layer in
+    /// `transfer.rs` builds on this.
+    pub(crate) fn usb_handle(&self) -> &rusb::DeviceHandle<rusb::Context> {
+        &self.handle
+    }
+
     /// Kernel-driver detach + `set_configuration(1)` +
     /// `claim_interface(0)`, exactly as `airspy_open_device` does.
     fn configure(handle: &mut rusb::DeviceHandle<rusb::Context>) -> Result<()> {
