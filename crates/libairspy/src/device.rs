@@ -246,6 +246,9 @@ impl Device {
             return Ok(Vec::new());
         }
         let mut raw = vec![0u8; count as usize * 4];
+        // count ≤ MAX_SAMPLERATE_COUNT < u16::MAX, so the fallback is
+        // unreachable — it exists only to keep this conversion
+        // panic-free without an unwrap.
         let index = u16::try_from(count).unwrap_or(u16::MAX);
         let n = self.vendor_in(Command::GetSamplerates, 0, index, &mut raw)?;
         if n < 1 {

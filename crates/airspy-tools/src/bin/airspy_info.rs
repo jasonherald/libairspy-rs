@@ -11,6 +11,10 @@ use libairspy_rs::{Device, Error, lib_version};
 /// `AIRSPY_MAX_DEVICE` in `airspy_info.c`.
 const MAX_DEVICES: usize = 32;
 
+/// The `0.000001f` Hz→MSPS factor in `airspy_info.c`'s sample-rate
+/// printout, kept in f32 to match the C tool's float arithmetic.
+const HZ_TO_MSPS: f32 = 0.000_001;
+
 #[derive(Parser)]
 #[command(
     name = "airspy_info",
@@ -60,7 +64,9 @@ fn main() {
         }
     }
 
-    for (i, device) in devices.iter().enumerate() {
+    // Consume the vec so each Device drops (closing its handle) at the
+    // end of its iteration — C calls airspy_close inside this loop.
+    for (i, device) in devices.into_iter().enumerate() {
         let board_num = i + 1;
         println!("\nFound AirSpy board {board_num}");
 
@@ -102,9 +108,9 @@ fn main() {
 
         println!("Supported sample rates:");
         for rate in device.samplerates() {
-            // C: "\t%f MSPS" with a float multiply by 0.000001f.
+            // C: "\t%f MSPS".
             #[allow(clippy::cast_precision_loss)]
-            let msps = *rate as f32 * 0.000_001;
+            let msps = *rate as f32 * HZ_TO_MSPS;
             println!("\t{msps:.6} MSPS");
         }
 
