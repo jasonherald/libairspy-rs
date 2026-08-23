@@ -133,6 +133,12 @@ features. Dev: golden-vector test helpers only (no heavy frameworks).
 - **Git flow**: protected `main`, feature branches, PRs reviewed by
   Jason + CodeRabbit + Codacy. Conventional, small PRs — one issue per
   PR where practical.
+- **Releases**: versions are marked by crates.io publishes of
+  `libairspy-rs`, following the librtlsdr-rs process — version bump +
+  `CHANGELOG.md` entry, annotated `vX.Y.Z` tag, GitHub Release titled
+  after the headline change, manual `cargo publish`. No release
+  automation initially. First publish is `v0.1.0` at M6; pre-1.0 semver
+  discipline (breaking changes bump the minor).
 
 ## Work control: milestones, epics, issues
 
