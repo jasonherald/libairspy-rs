@@ -8,6 +8,7 @@
 
 use rusb::UsbContext as _;
 
+use crate::commands::Command;
 use crate::error::{Error, Result};
 
 /// USB vendor id (`airspy_usb_vid` in airspy.c).
@@ -41,6 +42,25 @@ const fn serial_filter(serial_number: u64) -> Option<u64> {
     } else {
         Some(serial_number)
     }
+}
+
+/// Fallback rate table from `airspy_open_init` (airspy.c), used when
+/// the firmware `AIRSPY_GET_SAMPLERATES` query fails.
+const FALLBACK_SAMPLERATES: [u32; 2] = [10_000_000, 2_500_000];
+
+/// Cap on the firmware-reported rate count: a control transfer's
+/// wLength is a `u16`, so more than `u16::MAX / 4` words cannot
+/// arrive in one read (`airspy_read_samplerates_from_fw` in airspy.c
+/// passes `count * sizeof(uint32_t)` through that cast, truncating).
+const MAX_SAMPLERATE_COUNT: u32 = (u16::MAX as u32) / 4;
+
+/// Decode little-endian `u32` sample rates from the bytes actually
+/// transferred, dropping any partial trailing word (C leaves the tail
+/// of its buffer uninitialized on a short read; we simply omit it).
+fn samplerates_from_le_bytes(raw: &[u8]) -> Vec<u32> {
+    raw.chunks_exact(4)
+        .filter_map(|chunk| chunk.try_into().ok().map(u32::from_le_bytes))
+        .collect()
 }
 
 /// Parse an Airspy serial-number string descriptor into its `u64`
@@ -151,6 +171,7 @@ pub fn list_devices() -> Result<Vec<u64>> {
 #[derive(Debug)]
 pub struct Device {
     handle: rusb::DeviceHandle<rusb::Context>,
+    supported_samplerates: Vec<u32>,
 }
 
 impl Device {
@@ -186,9 +207,55 @@ impl Device {
                 // configuration/claim failure.
                 continue;
             }
-            return Ok(Self { handle });
+            let mut device = Self {
+                handle,
+                supported_samplerates: Vec::new(),
+            };
+            // airspy_open_init caches the firmware rate table at open,
+            // falling back to a fixed pair when the query fails.
+            device.supported_samplerates = device
+                .read_samplerates_from_fw()
+                .unwrap_or_else(|_| FALLBACK_SAMPLERATES.to_vec());
+            return Ok(device);
         }
         Err(Error::NotFound)
+    }
+
+    /// The supported sample rates cached at open
+    /// (`airspy_get_samplerates`; the C length/count two-call protocol
+    /// collapses into a slice).
+    ///
+    /// C doubles these values when a real (non-IQ) sample type is
+    /// selected; sample-type selection arrives with the streaming
+    /// engine, which revisits this.
+    #[must_use]
+    pub fn samplerates(&self) -> &[u32] {
+        &self.supported_samplerates
+    }
+
+    /// `airspy_read_samplerates_from_fw`: a 4-byte count query
+    /// (wIndex = 0) followed by a count-word read (wIndex = count).
+    fn read_samplerates_from_fw(&self) -> Result<Vec<u32>> {
+        let mut count_raw = [0u8; 4];
+        let n = self.vendor_in(Command::GetSamplerates, 0, 0, &mut count_raw)?;
+        if n < 1 {
+            // C: result < 1 → AIRSPY_ERROR_OTHER.
+            return Err(Error::Other);
+        }
+        let count = u32::from_le_bytes(count_raw).min(MAX_SAMPLERATE_COUNT);
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut raw = vec![0u8; count as usize * 4];
+        // count ≤ MAX_SAMPLERATE_COUNT < u16::MAX, so the fallback is
+        // unreachable — it exists only to keep this conversion
+        // panic-free without an unwrap.
+        let index = u16::try_from(count).unwrap_or(u16::MAX);
+        let n = self.vendor_in(Command::GetSamplerates, 0, index, &mut raw)?;
+        if n < 1 {
+            return Err(Error::Other);
+        }
+        Ok(samplerates_from_le_bytes(&raw[..n]))
     }
 
     /// Borrow the underlying USB handle; the vendor-request layer in
@@ -397,5 +464,35 @@ mod tests {
             Device::open_serial(unknown_serial),
             Err(crate::Error::NotFound)
         ));
+    }
+}
+
+#[cfg(test)]
+mod samplerate_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_table_matches_c() {
+        // airspy_open_init's fallback when the firmware rate query
+        // fails: {10000000, 2500000}.
+        assert_eq!(FALLBACK_SAMPLERATES, [10_000_000, 2_500_000]);
+    }
+
+    #[test]
+    fn samplerate_words_parse_little_endian() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&10_000_000u32.to_le_bytes());
+        raw.extend_from_slice(&2_500_000u32.to_le_bytes());
+        assert_eq!(samplerates_from_le_bytes(&raw), vec![10_000_000, 2_500_000]);
+    }
+
+    #[test]
+    fn partial_trailing_word_is_dropped() {
+        // Only complete words actually transferred are surfaced; C
+        // would leave the tail of its malloc'd buffer uninitialized.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&6_000_000u32.to_le_bytes());
+        raw.extend_from_slice(&[0x01, 0x02]);
+        assert_eq!(samplerates_from_le_bytes(&raw), vec![6_000_000]);
     }
 }
