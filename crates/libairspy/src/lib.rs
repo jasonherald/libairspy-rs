@@ -12,10 +12,12 @@
 //! [libairspy]: https://github.com/airspy/airspyone_host
 #![warn(missing_docs)]
 
+pub mod board;
 pub mod commands;
 pub mod device;
 pub mod error;
 mod transfer;
 
+pub use board::PartIdSerial;
 pub use device::{Device, list_devices};
 pub use error::{Error, Result};
