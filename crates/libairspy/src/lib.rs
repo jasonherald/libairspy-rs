@@ -14,6 +14,7 @@
 
 pub mod board;
 pub mod commands;
+mod conversion;
 pub mod device;
 pub mod error;
 pub mod stream;
