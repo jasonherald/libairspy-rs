@@ -338,12 +338,10 @@ mod tests {
 
     #[test]
     fn list_devices_enumerates_without_error() {
-        let serials = list_devices().expect("USB enumeration should succeed");
         // Zero devices in CI; each attached Airspy contributes a
-        // parsed serial.
-        for serial in &serials {
-            assert_ne!(*serial, u64::MAX, "implausible serial parsed");
-        }
+        // parsed serial. Every u64 is a valid serial (C appends
+        // whatever strtoull parsed), so success is the only invariant.
+        let _serials = list_devices().expect("USB enumeration should succeed");
     }
 
     #[test]
