@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 
 language: "en-US"
-tone_instructions: "Professional, concise. Prioritize idiomatic Rust, faithful-port correctness, and performance. USB driver + DSP crate — flag any vendor-request/register/command mismatch vs the original C libairspy, hot-path allocations, thread-safety issues in the streaming engine, and numerical accuracy concerns in the IQ converters."
+tone_instructions: "Professional, concise. Prioritize idiomatic Rust and faithful-port correctness. USB driver + DSP crate — flag command/register mismatches vs the C libairspy source, hot-path allocations, thread-safety and numerical accuracy issues."
 
 reviews:
   profile: "assertive"
