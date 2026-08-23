@@ -179,11 +179,12 @@ pub struct Device {
 
 impl core::fmt::Debug for Device {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The rusb handle's Debug prints an internal pointer; keep
+        // the output stable and address-free.
         f.debug_struct("Device")
-            .field("handle", &self.handle)
             .field("supported_samplerates", &self.supported_samplerates)
             .field("streaming", &self.workers.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

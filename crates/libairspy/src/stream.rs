@@ -101,12 +101,31 @@ impl SampleQueue {
         Self::with_pool(RAW_BUFFER_COUNT, RAW_BUFFER_COUNT + 1)
     }
 
-    /// Take a free buffer for the next bulk read. `None` when the pool
-    /// is exhausted (bounded by construction).
-    pub(crate) fn acquire_free(&self) -> Option<Vec<u8>> {
+    /// Take a free buffer without blocking. `None` when the pool is
+    /// exhausted (bounded by construction). Test-only: production
+    /// paths use the blocking [`SampleQueue::acquire_free`].
+    #[cfg(test)]
+    pub(crate) fn try_acquire_free(&self) -> Option<Vec<u8>> {
         match self.state.lock() {
             Ok(mut s) => s.free.pop(),
             Err(_) => None,
+        }
+    }
+
+    /// Take a free buffer, blocking until one is recycled or the queue
+    /// shuts down (`None`). Replaces a busy-wait in the reader: with
+    /// the sync read model, an exhausted pool means the consumer holds
+    /// every buffer, and the reader must sleep rather than spin.
+    pub(crate) fn acquire_free(&self) -> Option<Vec<u8>> {
+        let mut s = self.state.lock().ok()?;
+        loop {
+            if let Some(buf) = s.free.pop() {
+                return Some(buf);
+            }
+            if s.shutdown {
+                return None;
+            }
+            s = self.cv.wait(s).ok()?;
         }
     }
 
@@ -118,12 +137,18 @@ impl SampleQueue {
         if s.filled.len() >= self.capacity {
             s.dropped = s.dropped.saturating_add(1);
             s.free.push(buf);
+            drop(s);
+            // The recycled buffer may unblock a waiting reader.
+            self.cv.notify_all();
             return;
         }
         let dropped = std::mem::take(&mut s.dropped);
         s.filled.push_back((buf, dropped));
         drop(s);
-        self.cv.notify_one();
+        // One condvar serves both directions (filled and free);
+        // notify_all so a waiting consumer AND a buffer-starved
+        // reader can each re-check their predicate.
+        self.cv.notify_all();
     }
 
     /// Blocking pop: waits until a filled buffer arrives or
@@ -141,10 +166,13 @@ impl SampleQueue {
         }
     }
 
-    /// Return a consumed buffer to the free pool.
+    /// Return a consumed buffer to the free pool, waking a
+    /// buffer-starved reader.
     pub(crate) fn recycle(&self, buf: Vec<u8>) {
         if let Ok(mut s) = self.state.lock() {
             s.free.push(buf);
+            drop(s);
+            self.cv.notify_all();
         }
     }
 
@@ -213,13 +241,14 @@ pub(crate) fn run_consumer(
 /// docs).
 fn run_reader(shared: &StreamShared, handle: &rusb::DeviceHandle<rusb::Context>) {
     while shared.running() {
+        // Blocks until the consumer recycles a buffer or stop shuts
+        // the queue down. While blocked no reads are issued, so USB
+        // data lost in that window is uncounted — unlike C, whose
+        // still-completing transfers increment dropped_buffers; see
+        // the module docs on the sync-read deviation.
         let Some(mut buf) = shared.queue.acquire_free() else {
-            // Consumer holds every buffer; brief yield mirrors the
-            // full-ring drop path without busy-spinning.
-            std::thread::yield_now();
-            continue;
+            break;
         };
-        buf.resize(BUFFER_SIZE, 0);
         match handle.read_bulk(BULK_ENDPOINT, &mut buf, EVENT_TIMEOUT) {
             // C requires actual_length == length; a short transfer
             // stops streaming.
@@ -229,8 +258,17 @@ fn run_reader(shared: &StreamShared, handle: &rusb::DeviceHandle<rusb::Context>)
                 // polling while streaming.
                 shared.queue.recycle(buf);
             }
-            // Short transfers and hard errors both stop streaming.
-            Ok(_) | Err(_) => {
+            Ok(n) => {
+                tracing::warn!(
+                    bytes = n,
+                    expected = BUFFER_SIZE,
+                    "short bulk transfer; stopping stream"
+                );
+                shared.queue.recycle(buf);
+                shared.streaming.store(false, Ordering::SeqCst);
+            }
+            Err(err) => {
+                tracing::warn!(%err, "bulk read failed; stopping stream");
                 shared.queue.recycle(buf);
                 shared.streaming.store(false, Ordering::SeqCst);
             }
@@ -269,9 +307,23 @@ impl Device {
         &mut self,
         callback: impl FnMut(Transfer<'_>) -> bool + Send + 'static,
     ) -> Result<()> {
-        if self.stream_workers().is_some() {
-            // create_io_threads: streaming || stop_requested → BUSY.
-            return Err(Error::Busy);
+        // C gates on `streaming || stop_requested` only, so a device
+        // whose callback stopped the stream can be restarted; reap
+        // finished workers before the busy check.
+        if let Some(workers) = self.stream_workers() {
+            if workers.shared.running() {
+                return Err(Error::Busy);
+            }
+            let mut finished = self
+                .take_stream_workers()
+                .unwrap_or_else(|| unreachable!("workers just observed"));
+            finished.shared.queue.shutdown();
+            if let Some(t) = finished.reader.take() {
+                let _ = t.join();
+            }
+            if let Some(t) = finished.consumer.take() {
+                let _ = t.join();
+            }
         }
         // Converter resets and drop-counter zeroing from
         // airspy_start_rx happen via fresh queue/converter state here.
@@ -292,10 +344,16 @@ impl Device {
 
         let reader_shared = Arc::clone(&shared);
         let reader_handle = self.usb_handle_arc();
-        let reader = std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("airspy-reader".into())
-            .spawn(move || run_reader(&reader_shared, &reader_handle))
-            .map_err(|_| Error::Thread)?;
+            .spawn(move || run_reader(&reader_shared, &reader_handle));
+        let Ok(reader) = spawn_result else {
+            // Don't orphan the already-running consumer.
+            shared.streaming.store(false, Ordering::SeqCst);
+            shared.queue.shutdown();
+            let _ = consumer.join();
+            return Err(Error::Thread);
+        };
 
         self.set_stream_workers(Some(StreamWorkers {
             shared,
@@ -402,9 +460,38 @@ mod tests {
     #[test]
     fn pool_is_bounded() {
         let q = make_queue();
-        let held: Vec<_> = (0..4).map(|_| q.acquire_free().expect("pool")).collect();
-        assert!(q.acquire_free().is_none(), "pool must be bounded");
+        let held: Vec<_> = (0..4)
+            .map(|_| q.try_acquire_free().expect("pool"))
+            .collect();
+        assert!(q.try_acquire_free().is_none(), "pool must be bounded");
         drop(held);
+    }
+
+    #[test]
+    fn blocking_acquire_wakes_on_recycle() {
+        let q = Arc::new(make_queue());
+        let held: Vec<_> = (0..4)
+            .map(|_| q.try_acquire_free().expect("pool"))
+            .collect();
+        let q2 = Arc::clone(&q);
+        let waiter = std::thread::spawn(move || q2.acquire_free());
+        std::thread::sleep(core::time::Duration::from_millis(50));
+        let mut held = held;
+        q.recycle(held.pop().expect("held"));
+        assert!(waiter.join().expect("join").is_some());
+    }
+
+    #[test]
+    fn blocking_acquire_wakes_none_on_shutdown() {
+        let q = Arc::new(make_queue());
+        let _held: Vec<_> = (0..4)
+            .map(|_| q.try_acquire_free().expect("pool"))
+            .collect();
+        let q2 = Arc::clone(&q);
+        let waiter = std::thread::spawn(move || q2.acquire_free());
+        std::thread::sleep(core::time::Duration::from_millis(50));
+        q.shutdown();
+        assert!(waiter.join().expect("join").is_none());
     }
 
     #[test]
