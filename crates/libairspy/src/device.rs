@@ -183,7 +183,10 @@ impl core::fmt::Debug for Device {
         // the output stable and address-free.
         f.debug_struct("Device")
             .field("supported_samplerates", &self.supported_samplerates)
-            .field("streaming", &self.workers.is_some())
+            .field(
+                "streaming",
+                &self.workers.as_ref().is_some_and(|w| w.shared.running()),
+            )
             .finish_non_exhaustive()
     }
 }

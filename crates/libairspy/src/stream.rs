@@ -205,7 +205,7 @@ impl StreamShared {
         }
     }
 
-    fn running(&self) -> bool {
+    pub(crate) fn running(&self) -> bool {
         self.streaming.load(Ordering::SeqCst) && !self.stop_requested.load(Ordering::SeqCst)
     }
 }
@@ -310,18 +310,16 @@ impl Device {
         // C gates on `streaming || stop_requested` only, so a device
         // whose callback stopped the stream can be restarted; reap
         // finished workers before the busy check.
-        if let Some(workers) = self.stream_workers() {
+        if let Some(mut workers) = self.take_stream_workers() {
             if workers.shared.running() {
+                self.set_stream_workers(Some(workers));
                 return Err(Error::Busy);
             }
-            let mut finished = self
-                .take_stream_workers()
-                .unwrap_or_else(|| unreachable!("workers just observed"));
-            finished.shared.queue.shutdown();
-            if let Some(t) = finished.reader.take() {
+            workers.shared.queue.shutdown();
+            if let Some(t) = workers.reader.take() {
                 let _ = t.join();
             }
-            if let Some(t) = finished.consumer.take() {
+            if let Some(t) = workers.consumer.take() {
                 let _ = t.join();
             }
         }
@@ -337,10 +335,17 @@ impl Device {
 
         let consumer_shared = Arc::clone(&shared);
         let mut cb = callback;
-        let consumer = std::thread::Builder::new()
+        let consumer_spawn = std::thread::Builder::new()
             .name("airspy-consumer".into())
-            .spawn(move || run_consumer(&consumer_shared, &mut cb))
-            .map_err(|_| Error::Thread)?;
+            .spawn(move || run_consumer(&consumer_shared, &mut cb));
+        let Ok(consumer) = consumer_spawn else {
+            // Hardening beyond C (which leaves the receiver running
+            // until stop/close after a thread-create failure): switch
+            // it off so a failed start doesn't keep the device
+            // streaming into nothing.
+            let _ = self.set_receiver_mode(ReceiverMode::Off);
+            return Err(Error::Thread);
+        };
 
         let reader_shared = Arc::clone(&shared);
         let reader_handle = self.usb_handle_arc();
@@ -348,10 +353,12 @@ impl Device {
             .name("airspy-reader".into())
             .spawn(move || run_reader(&reader_shared, &reader_handle));
         let Ok(reader) = spawn_result else {
-            // Don't orphan the already-running consumer.
+            // Don't orphan the already-running consumer, and switch
+            // the receiver off (same hardening as above).
             shared.streaming.store(false, Ordering::SeqCst);
             shared.queue.shutdown();
             let _ = consumer.join();
+            let _ = self.set_receiver_mode(ReceiverMode::Off);
             return Err(Error::Thread);
         };
 
