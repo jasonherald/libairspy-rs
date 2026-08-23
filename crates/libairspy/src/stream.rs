@@ -372,9 +372,13 @@ impl Device {
 
     /// Stop streaming (`airspy_stop_rx`): request stop, switch the
     /// receiver off, then join the worker threads.
+    ///
+    /// Like C, the receiver-off command is sent even when no stream is
+    /// running — `airspy_stop_rx` does so unconditionally, which also
+    /// recovers a device left in RX by a failed [`Device::start_rx`].
     pub fn stop_rx(&mut self) -> Result<()> {
         let Some(mut workers) = self.take_stream_workers() else {
-            return Ok(());
+            return self.set_receiver_mode(ReceiverMode::Off);
         };
         workers.shared.stop_requested.store(true, Ordering::SeqCst);
         let mode_result = self.set_receiver_mode(ReceiverMode::Off);
