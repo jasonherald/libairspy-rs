@@ -15,6 +15,7 @@
 pub mod commands;
 pub mod device;
 pub mod error;
+mod transfer;
 
 pub use device::{Device, list_devices};
 pub use error::{Error, Result};
