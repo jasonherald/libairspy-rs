@@ -8,10 +8,6 @@
 //! result checks the C library does (`!= 0` for empty writes,
 //! `< length` for data transfers).
 
-// The first consumer is the board-info layer (#8); until it lands this
-// crate-internal plumbing has no callers outside its tests.
-#![allow(dead_code)]
-
 use core::time::Duration;
 
 use crate::commands::Command;
@@ -24,6 +20,8 @@ pub(crate) const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 /// `LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR |
 /// LIBUSB_RECIPIENT_DEVICE` — the bmRequestType of every host-to-device
 /// request in airspy.c (0x00 | 0x40 | 0x00).
+// First consumers are the receiver-mode/setter paths (M2/M4).
+#[allow(dead_code)]
 pub(crate) const VENDOR_OUT_REQUEST_TYPE: u8 = 0x40;
 
 /// `LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR |
@@ -35,6 +33,8 @@ impl Device {
     /// Host-to-device vendor request. Returns the number of bytes
     /// transferred; rusb/libusb errors map to `Error::Usb` (C's
     /// `AIRSPY_ERROR_LIBUSB`).
+    // First consumers are the receiver-mode/setter paths (M2/M4).
+    #[allow(dead_code)]
     pub(crate) fn vendor_out(
         &self,
         command: Command,
