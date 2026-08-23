@@ -10,7 +10,9 @@ use crate::error::{Error, Result};
 /// read requests `VERSION_LOCAL_SIZE - 1` bytes.
 const VERSION_LOCAL_SIZE: usize = 128;
 
-/// `sizeof(airspy_read_partid_serialno_t)` — 6 little-endian `u32`s.
+/// `sizeof(airspy_read_partid_serialno_t)` — 6 little-endian `u32`s,
+/// the transfer length in `airspy_board_partid_serialno_read`
+/// (airspy.c).
 const PARTID_SERIALNO_LEN: usize = 24;
 
 /// MCU part id and serial number
@@ -29,9 +31,10 @@ impl PartIdSerial {
     /// `TO_LE` to every word).
     fn from_le_bytes(raw: &[u8; PARTID_SERIALNO_LEN]) -> Self {
         let word = |i: usize| {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(&raw[i * 4..i * 4 + 4]);
-            u32::from_le_bytes(b)
+            let bytes: [u8; 4] = raw[i * 4..i * 4 + 4]
+                .try_into()
+                .expect("4-byte chunk of a 24-byte array");
+            u32::from_le_bytes(bytes)
         };
         Self {
             part_id: [word(0), word(1)],

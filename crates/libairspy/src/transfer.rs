@@ -19,7 +19,8 @@ pub(crate) const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// `LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR |
 /// LIBUSB_RECIPIENT_DEVICE` — the bmRequestType of every host-to-device
-/// request in airspy.c (0x00 | 0x40 | 0x00).
+/// request in airspy.c (0x00 | 0x40 | 0x00) — see e.g.
+/// `airspy_si5351c_write`'s libusb_control_transfer call.
 // First consumers are the receiver-mode/setter paths (M2/M4).
 #[allow(dead_code)]
 pub(crate) const VENDOR_OUT_REQUEST_TYPE: u8 = 0x40;
