@@ -1,0 +1,42 @@
+{
+  "summary": {
+    "languageCount": 3,
+    "fileCount": 15,
+    "enabledPatterns": { "before": null, "after": null },
+    "enabledTools": { "before": 6, "after": 6 },
+    "issues": { "before": 0, "after": 0 },
+    "issuesByCategory": {},
+    "issuesBySeverity": {}
+  },
+  "toolChanges": [],
+  "patternChanges": [],
+  "recommendedPathsToIgnore": [
+    {
+      "path": "test-data/**",
+      "reason": "Golden-vector files for DSP converter tests (arriving in milestone M3) are binary/hex reference data — likely to trigger secret-scanning and metric false positives. Recommend excluding via .codacy.yaml on main before M3 lands."
+    },
+    {
+      "path": "original/**",
+      "reason": "Defensive only — the reference C source is gitignored and never committed, so Codacy never sees it. Listed for parity with the CodeRabbit path_filters should it ever be committed by accident."
+    }
+  ],
+  "keyImprovements": [
+    "Verified the auto-registered configuration is already high-signal: 0 issues on main across 6 enabled tools (Opengrep, Trivy, Checkov, Lizard, markdownlint, Agentlinter); no wrong-stack tools enabled (Spectral and remark-lint correctly disabled).",
+    "Confirmed PR gating works: the zero-new-issues gate blocked PR #41 until the single finding was triaged, and passed PRs #42/#43 clean.",
+    "No Clippy analyzer exists in this Codacy tool roster — Rust lint depth is owned by CI (cargo clippy -D warnings, all features), with Codacy adding security (Opengrep/Trivy/Checkov) and complexity (Lizard) layers on top."
+  ],
+  "conflicts": [
+    {
+      "toolName": "(all)",
+      "conflict": "EnforcedByCodingStandard",
+      "codingStandardName": "Default coding standard",
+      "reason": "Repository follows org-level standards 'Default coding standard' (166670) and 'AI Policy' (166628); tool/pattern changes at repo level would be rejected. With a zero-issue baseline no changes were needed, so nothing was attempted. Adjustments, if ever needed, belong in the org standards."
+    },
+    {
+      "toolName": "AI review layer",
+      "conflict": "EnforcedByCodingStandard",
+      "codingStandardName": "AI Policy",
+      "reason": "The two noisy behaviors observed on PRs came from Codacy's AI review, not pattern config: a 'Potential PII' flag on the intentionally-public security contact email in SECURITY.md (triaged AcceptedUse), and a hallucinated HIGH-RISK claim that BoardId lacks R2=1/Mini=2 variants (no such IDs exist in upstream airspyone_host — rejected with evidence on PR #43). AI-review behavior is governed by the org 'AI Policy' standard, not repo patterns; recurring hallucinated findings should be addressed there."
+    }
+  ]
+}
