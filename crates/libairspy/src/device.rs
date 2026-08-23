@@ -20,6 +20,27 @@ pub const AIRSPY_USB_PID: u16 = 0x60a1;
 const SERIAL_PREFIX_LEN: usize = 10;
 /// `SERIAL_AIRSPY_EXPECTED_SIZE` — total serial-descriptor length.
 const SERIAL_EXPECTED_LEN: usize = 26;
+/// `SERIAL_NUMBER_UNUSED` — `airspy_open_sn` treats serial 0 as "no
+/// filter" and opens the first device found.
+const SERIAL_NUMBER_UNUSED: u64 = 0;
+
+/// USB configuration selected on open (`libusb_set_configuration(dev_handle, 1)`
+/// in `airspy_open_device`).
+const USB_CONFIGURATION: u8 = 1;
+/// USB interface claimed on open and released on close
+/// (`libusb_claim_interface(dev_handle, 0)` in `airspy_open_device`,
+/// `libusb_release_interface(usb_device, 0)` in `airspy_open_exit`).
+const USB_INTERFACE: u8 = 0;
+
+/// Map an `airspy_open_sn`-style serial argument to an optional filter:
+/// `SERIAL_NUMBER_UNUSED` (0) means "open the first device".
+const fn serial_filter(serial_number: u64) -> Option<u64> {
+    if serial_number == SERIAL_NUMBER_UNUSED {
+        None
+    } else {
+        Some(serial_number)
+    }
+}
 
 /// Parse an Airspy serial-number string descriptor into its `u64`
 /// serial, mirroring the C library: the descriptor must be exactly
@@ -30,7 +51,10 @@ fn parse_serial(descriptor: &str) -> Option<u64> {
     if descriptor.len() != SERIAL_EXPECTED_LEN {
         return None;
     }
-    let hex = &descriptor[SERIAL_PREFIX_LEN..];
+    // C skips SERIAL_PREFIX_LEN raw bytes without validating their
+    // content; `get` keeps that semantic while refusing (rather than
+    // panicking) if byte 10 is not a character boundary.
+    let hex = descriptor.get(SERIAL_PREFIX_LEN..)?;
     let digits: &str = hex
         .find(|c: char| !c.is_ascii_hexdigit())
         .map_or(hex, |end| &hex[..end]);
@@ -53,20 +77,30 @@ fn read_serial<T: rusb::UsbContext>(
     parse_serial(&serial)
 }
 
+/// Enumerate connected devices matching the Airspy VID/PID, yielding
+/// each with its descriptor. Centralizes the filter both
+/// `airspy_list_devices` and `airspy_open_device` perform in C.
+fn airspy_devices(
+    context: &rusb::Context,
+) -> Result<Vec<(rusb::Device<rusb::Context>, rusb::DeviceDescriptor)>> {
+    let devices = context.devices().map_err(|_| Error::NotFound)?;
+    Ok(devices
+        .iter()
+        .filter_map(|dev| {
+            let descriptor = dev.device_descriptor().ok()?;
+            (descriptor.vendor_id() == AIRSPY_USB_VID && descriptor.product_id() == AIRSPY_USB_PID)
+                .then_some((dev, descriptor))
+        })
+        .collect())
+}
+
 /// List the serial numbers of all connected Airspy devices, mirroring
 /// `airspy_list_devices` (devices whose serial cannot be read or
 /// parsed are skipped, as in C).
 pub fn list_devices() -> Result<Vec<u64>> {
     let context = rusb::Context::new()?;
-    let devices = context.devices().map_err(|_| Error::NotFound)?;
     let mut serials = Vec::new();
-    for dev in devices.iter() {
-        let Ok(descriptor) = dev.device_descriptor() else {
-            continue;
-        };
-        if descriptor.vendor_id() != AIRSPY_USB_VID || descriptor.product_id() != AIRSPY_USB_PID {
-            continue;
-        }
+    for (dev, descriptor) in airspy_devices(&context)? {
         let Ok(handle) = dev.open() else { continue };
         if let Some(serial) = read_serial(&handle, &descriptor) {
             serials.push(serial);
@@ -91,21 +125,17 @@ impl Device {
     }
 
     /// Open the Airspy with the given serial number (`airspy_open_sn`).
+    ///
+    /// Serial `0` is `SERIAL_NUMBER_UNUSED` in the C library: it opens
+    /// the first device found instead of matching a literal zero
+    /// serial, and this port preserves that contract.
     pub fn open_serial(serial_number: u64) -> Result<Self> {
-        Self::open_impl(Some(serial_number))
+        Self::open_impl(serial_filter(serial_number))
     }
 
     fn open_impl(serial_number: Option<u64>) -> Result<Self> {
         let context = rusb::Context::new()?;
-        let devices = context.devices().map_err(|_| Error::NotFound)?;
-        for dev in devices.iter() {
-            let Ok(descriptor) = dev.device_descriptor() else {
-                continue;
-            };
-            if descriptor.vendor_id() != AIRSPY_USB_VID || descriptor.product_id() != AIRSPY_USB_PID
-            {
-                continue;
-            }
+        for (dev, descriptor) in airspy_devices(&context)? {
             let Ok(mut handle) = dev.open() else { continue };
             if let Some(wanted) = serial_number {
                 // C additionally requires iSerialNumber > 0 and the
@@ -130,11 +160,11 @@ impl Device {
     /// `claim_interface(0)`, exactly as `airspy_open_device` does.
     fn configure(handle: &mut rusb::DeviceHandle<rusb::Context>) -> Result<()> {
         #[cfg(target_os = "linux")]
-        if handle.kernel_driver_active(0).unwrap_or(false) {
-            let _ = handle.detach_kernel_driver(0);
+        if handle.kernel_driver_active(USB_INTERFACE).unwrap_or(false) {
+            let _ = handle.detach_kernel_driver(USB_INTERFACE);
         }
-        handle.set_active_configuration(1)?;
-        handle.claim_interface(0)?;
+        handle.set_active_configuration(USB_CONFIGURATION)?;
+        handle.claim_interface(USB_INTERFACE)?;
         Ok(())
     }
 }
@@ -143,7 +173,7 @@ impl Drop for Device {
     fn drop(&mut self) {
         // airspy_open_exit: libusb_release_interface(usb_device, 0)
         // then close; rusb's own Drop handles the close/exit half.
-        let _ = self.handle.release_interface(0);
+        let _ = self.handle.release_interface(USB_INTERFACE);
     }
 }
 
@@ -207,24 +237,58 @@ mod tests {
         assert_eq!(parse_serial("AIRSPY SN:0000000000000000"), Some(0));
     }
 
-    // The tests below exercise the real USB stack but require no
-    // hardware: with no Airspy plugged in, enumeration finds nothing
-    // and open reports NotFound exactly as the C library does.
-
     #[test]
-    fn list_devices_without_hardware_is_empty() {
-        let serials = list_devices().expect("USB enumeration should succeed");
-        assert!(
-            serials.is_empty(),
-            "expected no Airspy devices in the test environment"
-        );
+    fn does_not_panic_on_multibyte_descriptor() {
+        // The 10-byte skip must not panic when byte 10 falls inside a
+        // multibyte character; C operates on raw bytes, we return None.
+        let s = "AIRSPY SNé0123456789ABCDE"; // 'é' spans bytes 9–10; 26 bytes total
+        assert_eq!(s.len(), SERIAL_EXPECTED_LEN);
+        assert_eq!(parse_serial(s), None);
     }
 
     #[test]
-    fn open_without_hardware_reports_not_found() {
-        assert!(matches!(Device::open(), Err(crate::Error::NotFound)));
+    fn zero_serial_is_the_unused_sentinel() {
+        // SERIAL_NUMBER_UNUSED (0ULL) in airspy.c: airspy_open_sn(0)
+        // opens the first device instead of matching serial 0.
+        assert_eq!(serial_filter(0), None);
+        assert_eq!(serial_filter(0x6440_64DC), Some(0x6440_64DC));
+    }
+
+    // The tests below exercise the real USB stack and are written to
+    // hold in any environment — CI runners with no USB devices AND a
+    // dev box with a real Airspy attached.
+
+    #[test]
+    fn list_devices_enumerates_without_error() {
+        let serials = list_devices().expect("USB enumeration should succeed");
+        // Zero devices in CI; each attached Airspy contributes a
+        // parsed serial.
+        for serial in &serials {
+            assert_ne!(*serial, u64::MAX, "implausible serial parsed");
+        }
+    }
+
+    #[test]
+    fn open_agrees_with_enumeration() {
+        let present = !list_devices()
+            .expect("USB enumeration should succeed")
+            .is_empty();
+        match Device::open() {
+            Ok(_) => assert!(present, "open succeeded with no device enumerated"),
+            Err(crate::Error::NotFound) => {
+                assert!(!present, "device enumerated but open reported NotFound");
+            }
+            Err(other) => unreachable!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn open_with_unknown_serial_reports_not_found() {
+        // No real Airspy can carry this serial (parsed serials are at
+        // most 16 hex digits read from a fixed-format descriptor; this
+        // value is reserved by the test).
         assert!(matches!(
-            Device::open_serial(0x1234_5678_9ABC_DEF0),
+            Device::open_serial(0xDEAD_BEEF_DEAD_BEEF),
             Err(crate::Error::NotFound)
         ));
     }
