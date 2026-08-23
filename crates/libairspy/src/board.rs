@@ -10,10 +10,14 @@ use crate::error::{Error, Result};
 /// read requests `VERSION_LOCAL_SIZE - 1` bytes.
 const VERSION_LOCAL_SIZE: usize = 128;
 
-/// `sizeof(airspy_read_partid_serialno_t)` — 6 little-endian `u32`s,
-/// the transfer length in `airspy_board_partid_serialno_read`
-/// (airspy.c).
-const PARTID_SERIALNO_LEN: usize = 24;
+/// Words in `airspy_read_partid_serialno_t` (airspy.h): `part_id[2]`
+/// followed by `serial_no[4]`.
+const PARTID_SERIALNO_WORDS: usize = 6;
+/// Wire width of each word (`uint32_t`).
+const WORD_LEN: usize = core::mem::size_of::<u32>();
+/// `sizeof(airspy_read_partid_serialno_t)` — the transfer length in
+/// `airspy_board_partid_serialno_read` (airspy.c).
+const PARTID_SERIALNO_LEN: usize = PARTID_SERIALNO_WORDS * WORD_LEN;
 
 /// MCU part id and serial number
 /// (`airspy_read_partid_serialno_t` in `airspy.h`).
@@ -30,13 +34,14 @@ impl PartIdSerial {
     /// `serial_no[0..4]`, each a little-endian `u32` (C applies
     /// `TO_LE` to every word).
     fn from_le_bytes(raw: &[u8; PARTID_SERIALNO_LEN]) -> Self {
-        // Panic-free, zero-allocation decode: peel one 4-byte chunk per
-        // word. The `if let` always matches (24 = 6 × 4) but keeps
-        // every path non-panicking per the library rules.
-        let mut words = [0u32; 6];
+        // Panic-free, zero-allocation decode: peel one word-sized
+        // chunk per word. The `if let` always matches (the array holds
+        // exactly PARTID_SERIALNO_WORDS words) but keeps every path
+        // non-panicking per the library rules.
+        let mut words = [0u32; PARTID_SERIALNO_WORDS];
         let mut rest: &[u8] = raw;
         for word in &mut words {
-            if let Some((chunk, tail)) = rest.split_first_chunk::<4>() {
+            if let Some((chunk, tail)) = rest.split_first_chunk::<WORD_LEN>() {
                 *word = u32::from_le_bytes(*chunk);
                 rest = tail;
             }
