@@ -4,7 +4,7 @@
 //! bounded channel; when the iterator falls behind, the channel fills,
 //! the consumer stalls, and the ring's C drop accounting takes over.
 
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use crate::commands::SampleType;
 use crate::conversion::Samples;
@@ -59,19 +59,11 @@ impl From<Transfer<'_>> for OwnedTransfer {
 /// keep-streaming flag — a dropped iterator (disconnected channel)
 /// stops the stream like a `false`-returning callback.
 ///
-/// A full channel blocks briefly via the bounded send, which stalls
-/// the consumer and pushes overflow into the ring's C drop
-/// accounting.
+/// A full channel blocks in the bounded send, stalling the consumer
+/// so overflow lands in the ring's C drop accounting; the send
+/// unblocks with an error the moment the receiver drops.
 fn forward_transfer(tx: &SyncSender<OwnedTransfer>, transfer: Transfer<'_>) -> bool {
-    match tx.try_send(OwnedTransfer::from(transfer)) {
-        Ok(()) => true,
-        Err(TrySendError::Full(block)) => {
-            // Block until the iterator catches up or goes away; the
-            // ring above continues counting drops while we wait.
-            tx.send(block).is_ok()
-        }
-        Err(TrySendError::Disconnected(_)) => false,
-    }
+    tx.send(OwnedTransfer::from(transfer)).is_ok()
 }
 
 /// Blocking iterator over sample blocks; created by
@@ -80,7 +72,10 @@ fn forward_transfer(tx: &SyncSender<OwnedTransfer>, transfer: Transfer<'_>) -> b
 #[derive(Debug)]
 pub struct BlockIter<'d> {
     device: &'d mut Device,
-    rx: Receiver<OwnedTransfer>,
+    /// `Option` so `Drop` can disconnect the channel BEFORE joining
+    /// the workers — a consumer blocked in a full-channel send would
+    /// otherwise deadlock `stop_rx`'s join.
+    rx: Option<Receiver<OwnedTransfer>>,
 }
 
 impl Iterator for BlockIter<'_> {
@@ -89,12 +84,16 @@ impl Iterator for BlockIter<'_> {
     /// Blocks until the next sample block, or `None` once streaming
     /// stops (stop request, device error, or callback shutdown).
     fn next(&mut self) -> Option<OwnedTransfer> {
-        self.rx.recv().ok()
+        self.rx.as_ref()?.recv().ok()
     }
 }
 
 impl Drop for BlockIter<'_> {
     fn drop(&mut self) {
+        // Disconnect first: a consumer stalled in the bounded send
+        // errors out immediately, so stop_rx's thread joins cannot
+        // deadlock on it.
+        drop(self.rx.take());
         let _ = self.device.stop_rx();
     }
 }
@@ -109,7 +108,10 @@ impl Device {
     pub fn rx_blocks(&mut self) -> Result<BlockIter<'_>> {
         let (tx, rx) = std::sync::mpsc::sync_channel(RAW_BUFFER_COUNT);
         self.start_rx(move |transfer| forward_transfer(&tx, transfer))?;
-        Ok(BlockIter { device: self, rx })
+        Ok(BlockIter {
+            device: self,
+            rx: Some(rx),
+        })
     }
 }
 
@@ -158,6 +160,38 @@ mod tests {
         // A dead receiver means the iterator is gone: stop streaming
         // (callback-false semantics).
         assert!(!forward_transfer(&tx, raw_transfer(&[3])));
+    }
+
+    #[test]
+    fn blocked_forward_unblocks_when_receiver_drops() {
+        // The Drop-order regression: a consumer stalled in a full
+        // channel's send must return (false) as soon as the receiver
+        // disconnects, so worker joins can't deadlock.
+        let (tx, rx) = mpsc::sync_channel::<OwnedTransfer>(1);
+        assert!(forward_transfer(&tx, raw_transfer(&[1]))); // fills the slot
+        let blocked = std::thread::spawn(move || forward_transfer(&tx, raw_transfer(&[2])));
+        std::thread::sleep(core::time::Duration::from_millis(50));
+        drop(rx);
+        assert!(
+            !blocked.join().expect("join"),
+            "send must fail after disconnect"
+        );
+    }
+
+    #[test]
+    fn blocked_forward_delivers_when_receiver_catches_up() {
+        let (tx, rx) = mpsc::sync_channel::<OwnedTransfer>(1);
+        assert!(forward_transfer(&tx, raw_transfer(&[1])));
+        let blocked = std::thread::spawn(move || forward_transfer(&tx, raw_transfer(&[2])));
+        std::thread::sleep(core::time::Duration::from_millis(50));
+        let first = rx.recv().expect("first");
+        assert!(matches!(first.samples, SampleBlock::Raw(ref b) if b.as_slice() == [1]));
+        assert!(
+            blocked.join().expect("join"),
+            "send completes once space frees"
+        );
+        let second = rx.recv().expect("second");
+        assert!(matches!(second.samples, SampleBlock::Raw(ref b) if b.as_slice() == [2]));
     }
 
     #[test]
