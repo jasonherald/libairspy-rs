@@ -19,6 +19,10 @@ pub mod device;
 pub mod error;
 pub mod reader;
 pub mod stream;
+#[cfg(feature = "smol")]
+pub mod stream_smol;
+#[cfg(feature = "tokio")]
+pub mod stream_tokio;
 mod transfer;
 
 pub use board::PartIdSerial;
