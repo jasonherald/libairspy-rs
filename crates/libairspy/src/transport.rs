@@ -84,6 +84,7 @@ impl UsbTransport for rusb::DeviceHandle<rusb::Context> {
 #[cfg(test)]
 pub(crate) mod mock {
     use super::UsbTransport;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -105,19 +106,40 @@ pub(crate) mod mock {
     /// transferred-byte count.
     type Scripted = rusb::Result<Vec<u8>>;
 
+    /// One scripted bulk-read outcome.
+    #[derive(Debug, Clone)]
+    pub(crate) enum BulkRead {
+        /// Fill the whole buffer with this byte (a complete transfer).
+        Fill(u8),
+        /// Transfer only this many bytes (a short transfer).
+        Short(usize),
+        /// Fail with this USB error.
+        Fail(rusb::Error),
+    }
+
     /// Recording, scriptable [`UsbTransport`] for boundary tests.
     #[derive(Debug, Default)]
     pub(crate) struct MockTransport {
         pub(crate) calls: Mutex<Vec<ControlCall>>,
-        responses: Mutex<Vec<Scripted>>,
+        responses: Mutex<VecDeque<Scripted>>,
+        bulk: Mutex<VecDeque<BulkRead>>,
     }
 
     impl MockTransport {
-        /// Queue the next scripted responses (consumed FIFO). An
-        /// unscripted call gets a full-success default.
+        /// Queue the next scripted control responses (consumed FIFO).
+        /// Unscripted writes succeed in full (so receiver-mode chatter
+        /// needn't be scripted everywhere); unscripted reads fail with
+        /// `NoDevice` so missing expectations surface loudly.
         pub(crate) fn script(&self, responses: Vec<Scripted>) {
-            let mut lock = self.responses.lock().expect("mock lock");
-            *lock = responses;
+            *self.responses.lock().expect("mock lock") = responses.into();
+        }
+
+        /// Queue bulk-read outcomes (consumed FIFO); once exhausted,
+        /// further reads time out — which the reader loop tolerates —
+        /// so the stream stays alive for the consumer to drain
+        /// (terminal outcomes are scripted explicitly).
+        pub(crate) fn script_bulk(&self, reads: Vec<BulkRead>) {
+            *self.bulk.lock().expect("mock lock") = reads.into();
         }
 
         /// Drain the recorded calls (e.g. to discard construction-time
@@ -127,12 +149,7 @@ pub(crate) mod mock {
         }
 
         fn next_response(&self) -> Option<Scripted> {
-            let mut lock = self.responses.lock().expect("mock lock");
-            if lock.is_empty() {
-                None
-            } else {
-                Some(lock.remove(0))
-            }
+            self.responses.lock().expect("mock lock").pop_front()
         }
     }
 
@@ -179,7 +196,9 @@ pub(crate) mod mock {
                 timeout,
             });
             match self.next_response() {
-                None => Ok(buf.len()),
+                // Unscripted reads fail loudly: silently returning
+                // zeroed data would hide missing test expectations.
+                None => Err(rusb::Error::NoDevice),
                 Some(Ok(bytes)) => {
                     let n = bytes.len().min(buf.len());
                     buf[..n].copy_from_slice(&bytes[..n]);
@@ -192,12 +211,24 @@ pub(crate) mod mock {
         fn read_bulk(
             &self,
             _endpoint: u8,
-            _buf: &mut [u8],
+            buf: &mut [u8],
             _timeout: Duration,
         ) -> rusb::Result<usize> {
-            // Streaming tests drive the queue directly; a mock stream
-            // ends immediately.
-            Err(rusb::Error::NoDevice)
+            match self.bulk.lock().expect("mock lock").pop_front() {
+                Some(BulkRead::Fill(byte)) => {
+                    buf.fill(byte);
+                    Ok(buf.len())
+                }
+                Some(BulkRead::Short(n)) => Ok(n.min(buf.len())),
+                Some(BulkRead::Fail(e)) => Err(e),
+                // Exhausted script: keep the stream alive via the
+                // tolerated timeout path (brief sleep avoids a busy
+                // poll loop).
+                None => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    Err(rusb::Error::Timeout)
+                }
+            }
         }
 
         fn clear_halt(&self, _endpoint: u8) -> rusb::Result<()> {

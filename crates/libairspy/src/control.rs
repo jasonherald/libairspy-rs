@@ -39,9 +39,8 @@ mod tests {
     /// (the samplerate query) already drained.
     pub(crate) fn mock_device() -> (Arc<MockTransport>, Device) {
         let transport = Arc::new(MockTransport::default());
-        // Fail the open-time samplerate query so the device takes the
-        // C fallback table deterministically.
-        transport.script(vec![Err(rusb::Error::NoDevice)]);
+        // Unscripted reads fail, so the open-time samplerate query
+        // takes the C fallback table deterministically.
         let device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
         transport.take_recorded();
         (transport, device)

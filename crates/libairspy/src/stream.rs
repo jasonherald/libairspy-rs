@@ -592,4 +592,111 @@ mod tests {
         assert_eq!(seen, vec![(1, 0), (2, 0)]);
         assert!(!shared.streaming.load(Ordering::SeqCst));
     }
+
+    #[test]
+    fn end_to_end_stream_over_mock_transport() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+        use std::sync::mpsc;
+
+        let transport = Arc::new(MockTransport::default());
+        // Three full buffers; the exhausted script then times out,
+        // keeping the stream alive until the test stops it.
+        transport.script_bulk(vec![
+            BulkRead::Fill(0xAB),
+            BulkRead::Fill(0xCD),
+            BulkRead::Fill(0xEF),
+        ]);
+        let mut device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+
+        let (tx, rx) = mpsc::channel();
+        device
+            .start_rx(move |transfer| {
+                let Samples::Raw(bytes) = transfer.samples else {
+                    unreachable!("RAW stream");
+                };
+                tx.send((bytes[0], bytes.len(), transfer.dropped_samples))
+                    .is_ok()
+            })
+            .expect("start_rx");
+
+        // The three scripted buffers arrive in order, full-sized.
+        for expected in [0xAB, 0xCD, 0xEF] {
+            let (first, len, dropped) = rx
+                .recv_timeout(core::time::Duration::from_secs(5))
+                .expect("block");
+            assert_eq!(first, expected);
+            assert_eq!(len, BUFFER_SIZE);
+            assert_eq!(dropped, 0);
+        }
+
+        // The stream is still alive on timeouts; stop_rx tears it
+        // down and joins cleanly.
+        assert!(device.is_streaming());
+        device.stop_rx().expect("stop");
+        assert!(!device.is_streaming());
+
+        let modes: Vec<(u8, u16)> = transport
+            .take_recorded()
+            .into_iter()
+            .filter(|c| c.request == 1) // AIRSPY_RECEIVER_MODE
+            .map(|c| (c.request, c.value))
+            .collect();
+        // start_rx: OFF then RX; stop_rx: OFF.
+        assert_eq!(modes, vec![(1, 0), (1, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn bulk_error_stops_stream() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+
+        let transport = Arc::new(MockTransport::default());
+        transport.script_bulk(vec![BulkRead::Fail(rusb::Error::Pipe)]);
+        let mut device = Device::from_transport(transport as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+        device.start_rx(|_| true).expect("start_rx");
+
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        while device.is_streaming() && std::time::Instant::now() < deadline {
+            std::thread::sleep(core::time::Duration::from_millis(10));
+        }
+        assert!(!device.is_streaming(), "bulk error must stop the stream");
+        device.stop_rx().expect("stop");
+    }
+
+    #[test]
+    fn short_bulk_read_stops_stream_without_delivery() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+        use std::sync::mpsc;
+
+        let transport = Arc::new(MockTransport::default());
+        transport.script_bulk(vec![BulkRead::Short(100)]);
+        let mut device = Device::from_transport(transport as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+
+        let (tx, rx) = mpsc::channel::<()>();
+        device
+            .start_rx(move |_| tx.send(()).is_ok())
+            .expect("start_rx");
+
+        // C requires actual_length == length: the short read delivers
+        // nothing and terminates the stream.
+        assert!(
+            rx.recv_timeout(core::time::Duration::from_millis(500))
+                .is_err(),
+            "no callback for a short transfer"
+        );
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        while device.is_streaming() && std::time::Instant::now() < deadline {
+            std::thread::sleep(core::time::Duration::from_millis(10));
+        }
+        assert!(!device.is_streaming());
+        device.stop_rx().expect("stop");
+    }
 }
