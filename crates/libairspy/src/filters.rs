@@ -2,7 +2,8 @@
 //! `airspyone_host` at the all-MIT reference revision `bd15be38`
 //! (MIT License, Copyright (C) 2014, Youssef Touil — see NOTICE).
 
-/// `HB_KERNEL_INT16_LEN` (filters.h).
+/// `HB_KERNEL_INT16_LEN` — `#define HB_KERNEL_INT16_LEN 47`
+/// (`filters.h`, `airspyone_host` @ `bd15be38`).
 pub(crate) const HB_KERNEL_INT16_LEN: usize = 47;
 
 /// `HB_KERNEL_INT16` (filters.h) — Q15 half-band low-pass taps; every

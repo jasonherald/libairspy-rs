@@ -102,6 +102,11 @@ pub(crate) const fn unpacked_sample_count(len: usize) -> usize {
 
 use crate::commands::SampleType;
 use crate::filters::HB_KERNEL_INT16;
+
+/// Values per complex sample — IQ slices interleave I and Q, and C
+/// halves `sample_count` for the IQ types (`consumer_threadproc`,
+/// airspy.c).
+const IQ_COMPONENTS: usize = 2;
 use crate::iqconverter_int16::IqConverterInt16;
 
 /// `SAMPLE_SHIFT` (airspy.c): `SAMPLE_ENCAPSULATION (16) -
@@ -230,23 +235,20 @@ pub(crate) fn convert_block<'a>(
         };
         return (Samples::Raw(bytes), count);
     }
-    // C: packing_enabled && sample_type != RAW → unpack first.
-    let words: &[u16] = if packing_enabled {
-        scratch
-            .unpacked
-            .resize(unpacked_sample_count(bytes.len()), 0);
-        let n = unpack_samples(bytes, &mut scratch.unpacked);
-        &scratch.unpacked[..n]
+    let words_len = prepare_words(packing_enabled, bytes, scratch);
+    // Field destructuring splits the borrows: the source word buffer
+    // stays shared while the per-type output buffer is written.
+    let Scratch {
+        unpacked,
+        words,
+        out_i16,
+        out_f32,
+        cnv_i,
+    } = scratch;
+    let src: &[u16] = if packing_enabled {
+        &unpacked[..words_len]
     } else {
-        // Unpacked mode: the byte stream is little-endian u16 words
-        // (C casts the buffer; we copy into the reusable scratch).
-        scratch.words.clear();
-        scratch.words.extend(
-            bytes
-                .chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]])),
-        );
-        &scratch.words
+        &words[..words_len]
     };
     match sample_type {
         SampleType::Raw | SampleType::Float32Iq => {
@@ -255,22 +257,44 @@ pub(crate) fn convert_block<'a>(
         SampleType::Int16Iq => {
             // C: convert_samples_int16 → iqconverter_int16_process →
             // sample_count /= 2.
-            scratch.out_i16.resize(words.len(), 0);
-            convert_samples_int16(words, &mut scratch.out_i16);
-            scratch.cnv_i.process(&mut scratch.out_i16);
-            (Samples::Int16(&scratch.out_i16), words.len() / 2)
+            out_i16.resize(words_len, 0);
+            convert_samples_int16(src, out_i16);
+            cnv_i.process(out_i16);
+            (Samples::Int16(out_i16), words_len / IQ_COMPONENTS)
         }
-        SampleType::Uint16Real => (Samples::Uint16(words), words.len()),
+        SampleType::Uint16Real => (Samples::Uint16(src), words_len),
         SampleType::Int16Real => {
-            scratch.out_i16.resize(words.len(), 0);
-            convert_samples_int16(words, &mut scratch.out_i16);
-            (Samples::Int16(&scratch.out_i16), words.len())
+            out_i16.resize(words_len, 0);
+            convert_samples_int16(src, out_i16);
+            (Samples::Int16(out_i16), words_len)
         }
         SampleType::Float32Real => {
-            scratch.out_f32.resize(words.len(), 0.0);
-            convert_samples_float(words, &mut scratch.out_f32);
-            (Samples::Float32(&scratch.out_f32), words.len())
+            out_f32.resize(words_len, 0.0);
+            convert_samples_float(src, out_f32);
+            (Samples::Float32(out_f32), words_len)
         }
+    }
+}
+
+/// The stream-format half of `consumer_threadproc`'s dispatch: fill
+/// the scratch word buffer from the raw bytes (12-bit unpack in packed
+/// mode, little-endian u16 view otherwise) and return the word count.
+fn prepare_words(packing_enabled: bool, bytes: &[u8], scratch: &mut Scratch) -> usize {
+    if packing_enabled {
+        scratch
+            .unpacked
+            .resize(unpacked_sample_count(bytes.len()), 0);
+        unpack_samples(bytes, &mut scratch.unpacked)
+    } else {
+        // C casts the buffer to uint16_t*; we copy into the reusable
+        // scratch through from_le_bytes.
+        scratch.words.clear();
+        scratch.words.extend(
+            bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]])),
+        );
+        scratch.words.len()
     }
 }
 
