@@ -597,7 +597,7 @@ mod tests {
     fn end_to_end_stream_over_mock_transport() {
         use crate::commands::SampleType;
         use crate::device::Device;
-        use crate::transport::mock::{BulkRead, MockTransport};
+        use crate::transport::mock::{BulkRead, MockTransport, wire};
         use std::sync::mpsc;
 
         let transport = Arc::new(MockTransport::default());
@@ -641,11 +641,18 @@ mod tests {
         let modes: Vec<(u8, u16)> = transport
             .take_recorded()
             .into_iter()
-            .filter(|c| c.request == 1) // AIRSPY_RECEIVER_MODE
+            .filter(|c| c.request == wire::RECEIVER_MODE)
             .map(|c| (c.request, c.value))
             .collect();
         // start_rx: OFF then RX; stop_rx: OFF.
-        assert_eq!(modes, vec![(1, 0), (1, 1), (1, 0)]);
+        assert_eq!(
+            modes,
+            vec![
+                (wire::RECEIVER_MODE, wire::RECEIVER_MODE_OFF),
+                (wire::RECEIVER_MODE, wire::RECEIVER_MODE_RX),
+                (wire::RECEIVER_MODE, wire::RECEIVER_MODE_OFF),
+            ]
+        );
     }
 
     #[test]

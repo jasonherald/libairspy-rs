@@ -88,6 +88,38 @@ pub(crate) mod mock {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    /// C-defined wire expectations for boundary tests — transcribed
+    /// independently from the Rust enums (`commands.rs`) so a
+    /// Rust-to-wire mismatch cannot hide. Sources: the
+    /// `airspy_vendor_request` enum (`airspy_commands.h`), the
+    /// `receiver_mode_t` enum, `LIBUSB_CTRL_TIMEOUT_MS` (airspy.c),
+    /// and the vendor `bmRequestType` compositions.
+    pub(crate) mod wire {
+        use std::time::Duration;
+
+        /// `AIRSPY_RECEIVER_MODE = 1` (`airspy_commands.h`).
+        pub(crate) const RECEIVER_MODE: u8 = 1;
+        /// `RECEIVER_MODE_OFF = 0` (`airspy_commands.h`).
+        pub(crate) const RECEIVER_MODE_OFF: u16 = 0;
+        /// `RECEIVER_MODE_RX = 1` (`airspy_commands.h`).
+        pub(crate) const RECEIVER_MODE_RX: u16 = 1;
+        /// `AIRSPY_SET_FREQ = 13` (`airspy_commands.h`).
+        pub(crate) const SET_FREQ: u8 = 13;
+        /// `AIRSPY_BOARD_ID_READ = 9` (`airspy_commands.h`).
+        pub(crate) const BOARD_ID_READ: u8 = 9;
+        /// OUT|VENDOR|DEVICE (airspy.c's host-to-device transfers).
+        pub(crate) const VENDOR_OUT: u8 = 0x40;
+        /// IN|VENDOR|DEVICE (airspy.c's device-to-host transfers).
+        pub(crate) const VENDOR_IN: u8 = 0xC0;
+        /// `LIBUSB_CTRL_TIMEOUT_MS = 500` (airspy.c).
+        pub(crate) const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
+    }
+
+    /// Poll delay served while the bulk script is exhausted — a
+    /// mock-only pacing value with no C equivalent (the real device
+    /// blocks in libusb instead).
+    const EXHAUSTED_BULK_POLL: Duration = Duration::from_millis(5);
+
     /// One recorded control transfer.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct ControlCall {
@@ -225,7 +257,7 @@ pub(crate) mod mock {
                 // tolerated timeout path (brief sleep avoids a busy
                 // poll loop).
                 None => {
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(EXHAUSTED_BULK_POLL);
                     Err(rusb::Error::Timeout)
                 }
             }

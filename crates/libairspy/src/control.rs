@@ -30,10 +30,9 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use crate::device::Device;
-    use crate::transport::mock::MockTransport;
+    use crate::transport::mock::{MockTransport, wire};
 
     /// A Device over a mock transport, with construction-time traffic
     /// (the samplerate query) already drained.
@@ -63,11 +62,11 @@ mod tests {
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 1);
         let c = &calls[0];
-        assert_eq!(c.request_type, 0x40);
-        assert_eq!(c.request, 13);
+        assert_eq!(c.request_type, wire::VENDOR_OUT);
+        assert_eq!(c.request, wire::SET_FREQ);
         assert_eq!((c.value, c.index), (0, 0));
         assert_eq!(c.data, vec![0x00, 0xE1, 0xF5, 0x05]);
-        assert_eq!(c.timeout, Duration::from_millis(500));
+        assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
     }
 
     #[test]
@@ -95,15 +94,19 @@ mod tests {
     #[test]
     fn board_id_read_wire_contract_and_value() {
         let (transport, device) = mock_device();
-        transport.script(vec![Ok(vec![0u8])]);
+        // Non-zero id: proves response bytes actually reach the
+        // caller (a zeroed buffer can't fake it).
+        transport.script(vec![Ok(vec![0x42u8])]);
         let id = device.board_id().expect("board id");
-        assert_eq!(id, 0);
+        assert_eq!(id, 0x42);
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 1);
         let c = &calls[0];
-        assert_eq!(c.request_type, 0xC0);
-        assert_eq!(c.request, 9); // AIRSPY_BOARD_ID_READ
+        assert_eq!(c.request_type, wire::VENDOR_IN);
+        assert_eq!(c.request, wire::BOARD_ID_READ);
+        assert_eq!((c.value, c.index), (0, 0));
         assert_eq!(c.data.len(), 1);
+        assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
     }
 
     #[test]
@@ -114,8 +117,8 @@ mod tests {
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 1);
         let c = &calls[0];
-        assert_eq!(c.request, 1); // AIRSPY_RECEIVER_MODE
-        assert_eq!(c.value, 0); // RECEIVER_MODE_OFF
+        assert_eq!(c.request, wire::RECEIVER_MODE);
+        assert_eq!(c.value, wire::RECEIVER_MODE_OFF);
         assert!(c.data.is_empty());
     }
 
