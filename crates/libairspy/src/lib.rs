@@ -17,6 +17,8 @@ pub mod commands;
 pub mod conversion;
 pub mod device;
 pub mod error;
+mod filters;
+mod iqconverter_int16;
 pub mod reader;
 pub mod stream;
 #[cfg(feature = "smol")]

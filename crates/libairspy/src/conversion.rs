@@ -101,6 +101,13 @@ pub(crate) const fn unpacked_sample_count(len: usize) -> usize {
 }
 
 use crate::commands::SampleType;
+use crate::filters::HB_KERNEL_INT16;
+
+/// Values per complex sample — IQ slices interleave I and Q, and C
+/// halves `sample_count` for the IQ types (`consumer_threadproc`,
+/// airspy.c).
+const IQ_COMPONENTS: usize = 2;
+use crate::iqconverter_int16::IqConverterInt16;
 
 /// `SAMPLE_SHIFT` (airspy.c): `SAMPLE_ENCAPSULATION (16) -
 /// SAMPLE_RESOLUTION (12)`.
@@ -144,14 +151,29 @@ pub enum Samples<'a> {
     Raw(&'a [u8]),
 }
 
-/// Reusable consumer-thread buffers — C's `unpacked_samples` and
-/// `output_buffer`, allocated once and recycled per block.
-#[derive(Debug, Default)]
+/// Reusable consumer-thread buffers and converter state — C's
+/// `unpacked_samples`, `output_buffer`, and `cnv_i` (created at open
+/// with the stock kernels, reset per `airspy_start_rx`; a fresh
+/// `Scratch` per stream is that reset).
+#[derive(Debug)]
 pub(crate) struct Scratch {
     unpacked: Vec<u16>,
     words: Vec<u16>,
     out_i16: Vec<i16>,
     out_f32: Vec<f32>,
+    cnv_i: IqConverterInt16,
+}
+
+impl Default for Scratch {
+    fn default() -> Self {
+        Self {
+            unpacked: Vec::new(),
+            words: Vec::new(),
+            out_i16: Vec::new(),
+            out_f32: Vec::new(),
+            cnv_i: IqConverterInt16::new(&HB_KERNEL_INT16),
+        }
+    }
 }
 
 impl Scratch {
@@ -187,22 +209,22 @@ impl Scratch {
 
 /// The sample-type dispatch from `consumer_threadproc` (airspy.c):
 /// optional 12-bit unpack, then per-type conversion. Returns the
-/// typed samples plus the sample count C would report for the block.
+/// typed samples plus the sample count C would report for the block —
+/// halved for IQ types, whose slices hold `count` interleaved I/Q
+/// pairs (`2 × count` values).
 ///
-/// The IQ types are absent until the DSP converters land (the
-/// streaming engine rejects them at `start_rx`).
+/// `Float32Iq` is absent until its converter lands (the streaming
+/// engine rejects it at `start_rx`).
 pub(crate) fn convert_block<'a>(
     sample_type: SampleType,
     packing_enabled: bool,
     bytes: &'a [u8],
     scratch: &'a mut Scratch,
 ) -> (Samples<'a>, usize) {
-    // RAW (and the not-yet-supported IQ types, which start_rx refuses
-    // and which degrade to RAW delivery here) bypass all preparation.
-    if matches!(
-        sample_type,
-        SampleType::Raw | SampleType::Float32Iq | SampleType::Int16Iq
-    ) {
+    // RAW (and the not-yet-supported Float32Iq, which start_rx
+    // refuses and which degrades to RAW delivery here) bypasses all
+    // preparation.
+    if matches!(sample_type, SampleType::Raw | SampleType::Float32Iq) {
         // C sets the packed sample_count before the RAW branch skips
         // unpacking, so a packed RAW stream reports the unpacked
         // count (174762 per full buffer), not bytes/2.
@@ -213,39 +235,70 @@ pub(crate) fn convert_block<'a>(
         };
         return (Samples::Raw(bytes), count);
     }
-    // C: packing_enabled && sample_type != RAW → unpack first.
-    let words: &[u16] = if packing_enabled {
+    let words_len = prepare_words(packing_enabled, bytes, scratch);
+    // Field destructuring splits the borrows: the source word buffer
+    // stays shared while the per-type output buffer is written.
+    let Scratch {
+        unpacked,
+        words,
+        out_i16,
+        out_f32,
+        cnv_i,
+    } = scratch;
+    let src: &[u16] = if packing_enabled {
+        &unpacked[..words_len]
+    } else {
+        &words[..words_len]
+    };
+    match sample_type {
+        SampleType::Raw | SampleType::Float32Iq => {
+            unreachable!("handled by the early return above")
+        }
+        SampleType::Int16Iq => {
+            // C: convert_samples_int16 → iqconverter_int16_process →
+            // sample_count /= 2. The converter consumes every word
+            // (state parity with C), but the delivered slice holds
+            // only complete IQ pairs — an odd word count would
+            // otherwise dangle an unpaired I component.
+            out_i16.resize(words_len, 0);
+            convert_samples_int16(src, out_i16);
+            cnv_i.process(out_i16);
+            let pairs = words_len / IQ_COMPONENTS;
+            (Samples::Int16(&out_i16[..pairs * IQ_COMPONENTS]), pairs)
+        }
+        SampleType::Uint16Real => (Samples::Uint16(src), words_len),
+        SampleType::Int16Real => {
+            out_i16.resize(words_len, 0);
+            convert_samples_int16(src, out_i16);
+            (Samples::Int16(out_i16), words_len)
+        }
+        SampleType::Float32Real => {
+            out_f32.resize(words_len, 0.0);
+            convert_samples_float(src, out_f32);
+            (Samples::Float32(out_f32), words_len)
+        }
+    }
+}
+
+/// The stream-format half of `consumer_threadproc`'s dispatch: fill
+/// the scratch word buffer from the raw bytes (12-bit unpack in packed
+/// mode, little-endian u16 view otherwise) and return the word count.
+fn prepare_words(packing_enabled: bool, bytes: &[u8], scratch: &mut Scratch) -> usize {
+    if packing_enabled {
         scratch
             .unpacked
             .resize(unpacked_sample_count(bytes.len()), 0);
-        let n = unpack_samples(bytes, &mut scratch.unpacked);
-        &scratch.unpacked[..n]
+        unpack_samples(bytes, &mut scratch.unpacked)
     } else {
-        // Unpacked mode: the byte stream is little-endian u16 words
-        // (C casts the buffer; we copy into the reusable scratch).
+        // C casts the buffer to uint16_t*; we copy into the reusable
+        // scratch through from_le_bytes.
         scratch.words.clear();
         scratch.words.extend(
             bytes
                 .chunks_exact(2)
                 .map(|b| u16::from_le_bytes([b[0], b[1]])),
         );
-        &scratch.words
-    };
-    match sample_type {
-        SampleType::Raw | SampleType::Float32Iq | SampleType::Int16Iq => {
-            unreachable!("handled by the early return above")
-        }
-        SampleType::Uint16Real => (Samples::Uint16(words), words.len()),
-        SampleType::Int16Real => {
-            scratch.out_i16.resize(words.len(), 0);
-            convert_samples_int16(words, &mut scratch.out_i16);
-            (Samples::Int16(&scratch.out_i16), words.len())
-        }
-        SampleType::Float32Real => {
-            scratch.out_f32.resize(words.len(), 0.0);
-            convert_samples_float(words, &mut scratch.out_f32);
-            (Samples::Float32(&scratch.out_f32), words.len())
-        }
+        scratch.words.len()
     }
 }
 
@@ -459,6 +512,60 @@ mod tests {
         };
         assert!(w[0].abs() < f32::EPSILON);
         assert!((w[1] + 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dispatch_int16_iq_matches_golden_vectors() {
+        // consumer_threadproc INT16_IQ: convert_samples_int16 →
+        // iqconverter_int16_process → sample_count/2 (the buffer keeps
+        // len interleaved I/Q values).
+        use crate::test_vectors::load_scenario;
+        let v = load_scenario("noise");
+        let bytes: Vec<u8> = v.input[..2048]
+            .iter()
+            .flat_map(|&w| w.to_le_bytes())
+            .collect();
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Int16Iq, false, &bytes, &mut scratch);
+        assert_eq!(count, 1024, "IQ halves the sample count");
+        let Samples::Int16(out) = samples else {
+            unreachable!("Int16Iq delivers i16 samples");
+        };
+        assert_eq!(out, &v.int16[..2048], "golden-vector mismatch");
+    }
+
+    #[test]
+    fn dispatch_int16_iq_state_persists_across_blocks() {
+        use crate::test_vectors::load_scenario;
+        let v = load_scenario("tone");
+        let mut scratch = Scratch::default();
+        for block in 0..3 {
+            let range = block * 2048..(block + 1) * 2048;
+            let bytes: Vec<u8> = v.input[range.clone()]
+                .iter()
+                .flat_map(|&w| w.to_le_bytes())
+                .collect();
+            let (samples, _) = convert_block(SampleType::Int16Iq, false, &bytes, &mut scratch);
+            let Samples::Int16(out) = samples else {
+                unreachable!("Int16Iq delivers i16 samples");
+            };
+            assert_eq!(out, &v.int16[range], "block {block} mismatch");
+        }
+    }
+
+    #[test]
+    fn dispatch_int16_iq_delivers_only_complete_pairs() {
+        // Eight packed bytes decode to five words: the converter
+        // consumes all five, but the callback slice holds two complete
+        // IQ pairs (four values).
+        let packed_tail: [u8; 8] = [0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A];
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Int16Iq, true, &packed_tail, &mut scratch);
+        assert_eq!(count, 2);
+        let Samples::Int16(out) = samples else {
+            unreachable!("Int16Iq delivers i16 samples");
+        };
+        assert_eq!(out.len(), 4, "only complete IQ pairs delivered");
     }
 
     #[test]

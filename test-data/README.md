@@ -19,6 +19,14 @@ ifdef.
 
 These vector files are program output, committed as fixtures.
 
+**State-zeroing note:** upstream's `iqconverter_int16` create/reset
+leaves parts of its state uninitialized (the reset memsets use
+`sizeof(int16_t)` for the `int32_t` FIR queue and a quarter-sized
+delay-line clear), so raw C output depends on allocator leftovers. The
+harness therefore zeroes the int16 converter's full state after
+create, making the vectors capture the algorithm rather than the
+heap; the float converter's reset is correct and needs no such step.
+
 ## Format (`iq/`)
 
 Per scenario (`impulse`, `dc`, `tone`, `noise`), three files, one value
@@ -46,7 +54,9 @@ seed `0x12345678`, top 12 bits).
    PR that introduced these vectors for its source):
    `gcc -O2 -I <scratch> gen_vectors.c iqconverter_float.c
    iqconverter_int16.c -lm`
-3. Run from the repository root; it rewrites `test-data/iq/`.
+3. Run from the repository root; it rewrites `test-data/iq/`. The
+   harness must fully zero the int16 converter state after create
+   (see the state-zeroing note above).
 
 The `tone` inputs are produced with `sin(3)`/libm, so regeneration on a
 different platform could alter *input* words slightly — the committed
