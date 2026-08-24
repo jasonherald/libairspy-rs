@@ -117,9 +117,12 @@ mod tests {
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 1);
         let c = &calls[0];
+        assert_eq!(c.request_type, wire::VENDOR_OUT);
         assert_eq!(c.request, wire::RECEIVER_MODE);
         assert_eq!(c.value, wire::RECEIVER_MODE_OFF);
+        assert_eq!(c.index, 0);
         assert!(c.data.is_empty());
+        assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
     }
 
     #[test]
