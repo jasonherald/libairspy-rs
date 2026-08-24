@@ -81,6 +81,14 @@ pub(crate) fn unpack_samples(input: &[u8], output: &mut [u16]) -> usize {
             push(((w0 & 0xFF) << 4) | ((w1 >> 28) & 0xF));
             push((w1 & 0x0FFF_0000) >> 16);
             push((w1 & 0xFFF0) >> 4);
+            if tail.len() >= BYTES_PER_GROUP {
+                // A full group landed in the tail because the output
+                // bound (not the input) limited the group loop.
+                let w2 = word(tail, 2);
+                push(((w1 & 0xF) << 8) | ((w2 & 0xFF00_0000) >> 24));
+                push((w2 >> 12) & 0xFFF);
+                push(w2 & 0xFFF);
+            }
         }
     }
     written
@@ -329,6 +337,27 @@ mod tests {
         let mut short_out = [0u16; 11];
         assert_eq!(unpack_samples(&input8, &mut short_out), 11);
         assert_eq!(&short_out[8..], &[0x123, 0x456, 0x789]);
+    }
+
+    #[test]
+    fn output_bounded_decoding_fills_every_slot() {
+        // With ample input, an output of 7 gets 7 samples (s0..s6 of
+        // the first group), and an output of 15 gets a full group plus
+        // s0..s6 of the next — the output bound, not the group shape,
+        // limits what is written.
+        let g1 = [0x111, 0x222, 0x333, 0x444, 0x555, 0x666, 0x777, 0x888];
+        let g2 = [0x999, 0xAAA, 0xBBB, 0xCCC, 0xDDD, 0xEEE, 0xFFF, 0x123];
+        let mut input = pack_group(g1);
+        input.extend_from_slice(&pack_group(g2));
+
+        let mut out7 = [0u16; 7];
+        assert_eq!(unpack_samples(&input, &mut out7), 7);
+        assert_eq!(out7, g1[..7]);
+
+        let mut out15 = [0u16; 15];
+        assert_eq!(unpack_samples(&input, &mut out15), 15);
+        assert_eq!(&out15[..8], &g1);
+        assert_eq!(&out15[8..], &g2[..7]);
     }
 
     #[test]

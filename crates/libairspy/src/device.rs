@@ -54,11 +54,22 @@ const FALLBACK_SAMPLERATES: [u32; 2] = [10_000_000, 2_500_000];
 /// `airspy_get_samplerates` (airspy.c): non-IQ sample types — RAW
 /// included — see the firmware rates doubled
 /// (`!SAMPLE_TYPE_IS_IQ(device->sample_type)` → `buffer[i] *= 2`).
+/// The non-IQ rate multiplier in `airspy_get_samplerates`'s
+/// `buffer[i] *= 2` (airspy.c).
+const NON_IQ_RATE_FACTOR: u32 = 2;
+
 fn rates_for_sample_type(rates: &[u32], sample_type: SampleType) -> Vec<u32> {
     let is_iq = matches!(sample_type, SampleType::Float32Iq | SampleType::Int16Iq);
     rates
         .iter()
-        .map(|&r| if is_iq { r } else { r.saturating_mul(2) })
+        // wrapping_mul: C's uint32_t multiply wraps on overflow.
+        .map(|&r| {
+            if is_iq {
+                r
+            } else {
+                r.wrapping_mul(NON_IQ_RATE_FACTOR)
+            }
+        })
         .collect()
 }
 
