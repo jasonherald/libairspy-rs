@@ -150,20 +150,32 @@ pub(crate) mod mock {
     }
 
     /// Recording, scriptable [`UsbTransport`] for boundary tests.
+    /// Read and write responses queue separately so a control write
+    /// can never consume a response scripted for a read (or vice
+    /// versa), keeping tests independent of unrelated call ordering.
     #[derive(Debug, Default)]
     pub(crate) struct MockTransport {
         pub(crate) calls: Mutex<Vec<ControlCall>>,
-        responses: Mutex<VecDeque<Scripted>>,
+        write_responses: Mutex<VecDeque<Scripted>>,
+        read_responses: Mutex<VecDeque<Scripted>>,
         bulk: Mutex<VecDeque<BulkRead>>,
     }
 
     impl MockTransport {
-        /// Queue the next scripted control responses (consumed FIFO).
-        /// Unscripted writes succeed in full (so receiver-mode chatter
-        /// needn't be scripted everywhere); unscripted reads fail with
-        /// `NoDevice` so missing expectations surface loudly.
-        pub(crate) fn script(&self, responses: Vec<Scripted>) {
-            *self.responses.lock().expect("mock lock") = responses.into();
+        /// Queue scripted responses for control WRITES (consumed
+        /// FIFO). Unscripted writes succeed in full, so receiver-mode
+        /// chatter needn't be scripted everywhere; `Ok` values are
+        /// transferred-byte counts.
+        pub(crate) fn script_writes(&self, responses: Vec<Scripted>) {
+            *self.write_responses.lock().expect("mock lock") = responses.into();
+        }
+
+        /// Queue scripted responses for control READS (consumed FIFO).
+        /// Unscripted reads fail with `NoDevice` so missing
+        /// expectations surface loudly; `Ok` bytes fill the caller's
+        /// buffer.
+        pub(crate) fn script_reads(&self, responses: Vec<Scripted>) {
+            *self.read_responses.lock().expect("mock lock") = responses.into();
         }
 
         /// Queue bulk-read outcomes (consumed FIFO); once exhausted,
@@ -180,8 +192,12 @@ pub(crate) mod mock {
             std::mem::take(&mut *self.calls.lock().expect("mock lock"))
         }
 
-        fn next_response(&self) -> Option<Scripted> {
-            self.responses.lock().expect("mock lock").pop_front()
+        fn next_write_response(&self) -> Option<Scripted> {
+            self.write_responses.lock().expect("mock lock").pop_front()
+        }
+
+        fn next_read_response(&self) -> Option<Scripted> {
+            self.read_responses.lock().expect("mock lock").pop_front()
         }
     }
 
@@ -203,7 +219,7 @@ pub(crate) mod mock {
                 data: buf.to_vec(),
                 timeout,
             });
-            match self.next_response() {
+            match self.next_write_response() {
                 None => Ok(buf.len()),
                 Some(Ok(bytes)) => Ok(bytes.len()),
                 Some(Err(e)) => Err(e),
@@ -227,7 +243,7 @@ pub(crate) mod mock {
                 data: vec![0; buf.len()],
                 timeout,
             });
-            match self.next_response() {
+            match self.next_read_response() {
                 // Unscripted reads fail loudly: silently returning
                 // zeroed data would hide missing test expectations.
                 None => Err(rusb::Error::NoDevice),

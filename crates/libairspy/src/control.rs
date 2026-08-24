@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn set_freq_short_write_maps_to_length_mismatch() {
         let (transport, device) = mock_device();
-        transport.script(vec![Ok(vec![0u8; 2])]); // 2 of 4 bytes
+        transport.script_writes(vec![Ok(vec![0u8; 2])]); // 2 of 4 bytes
         let err = device.set_freq(1).expect_err("short write");
         assert!(matches!(
             err,
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn set_freq_usb_error_passes_through() {
         let (transport, device) = mock_device();
-        transport.script(vec![Err(rusb::Error::Pipe)]);
+        transport.script_writes(vec![Err(rusb::Error::Pipe)]);
         let err = device.set_freq(1).expect_err("usb error");
         assert!(matches!(err, crate::Error::Usb(rusb::Error::Pipe)));
     }
@@ -96,7 +96,7 @@ mod tests {
         let (transport, device) = mock_device();
         // Non-zero id: proves response bytes actually reach the
         // caller (a zeroed buffer can't fake it).
-        transport.script(vec![Ok(vec![0x42u8])]);
+        transport.script_reads(vec![Ok(vec![0x42u8])]);
         let id = device.board_id().expect("board id");
         assert_eq!(id, 0x42);
         let calls = transport.take_recorded();
@@ -126,7 +126,7 @@ mod tests {
     fn from_transport_caches_scripted_samplerates() {
         let transport = Arc::new(MockTransport::default());
         // Count query (4 bytes LE) then the rate list.
-        transport.script(vec![
+        transport.script_reads(vec![
             Ok(2u32.to_le_bytes().to_vec()),
             Ok([6_000_000u32, 3_000_000u32]
                 .iter()
