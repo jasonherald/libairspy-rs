@@ -143,7 +143,14 @@ mod tests {
 
     #[test]
     fn from_transport_falls_back_when_query_fails() {
-        let (_, device) = mock_device();
+        // Construct directly so the construction-time recording is
+        // retained: the fallback must be reached BECAUSE the firmware
+        // query failed, not silently.
+        let transport = Arc::new(MockTransport::default());
+        let device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 1, "exactly the count query");
+        assert_eq!(calls[0].request, 25); // AIRSPY_GET_SAMPLERATES
         // The C fallback pair, undoubled for the IQ default; asserted
         // against the independent wire transcription so production
         // drift is caught.

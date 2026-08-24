@@ -124,6 +124,14 @@ pub(crate) mod mock {
     /// blocks in libusb instead).
     const EXHAUSTED_BULK_POLL: Duration = Duration::from_millis(5);
 
+    /// One recorded bulk read's parameters.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct BulkCall {
+        pub(crate) endpoint: u8,
+        pub(crate) buf_len: usize,
+        pub(crate) timeout: Duration,
+    }
+
     /// One recorded control transfer.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct ControlCall {
@@ -147,7 +155,9 @@ pub(crate) mod mock {
     pub(crate) enum BulkRead {
         /// Fill the whole buffer with this byte (a complete transfer).
         Fill(u8),
-        /// Transfer only this many bytes (a short transfer).
+        /// Transfer only this many bytes — clamped to strictly less
+        /// than the buffer length so a mis-scripted value can never
+        /// masquerade as a complete transfer.
         Short(usize),
         /// Fail with this USB error.
         Fail(rusb::Error),
@@ -160,6 +170,7 @@ pub(crate) mod mock {
     #[derive(Debug, Default)]
     pub(crate) struct MockTransport {
         pub(crate) calls: Mutex<Vec<ControlCall>>,
+        pub(crate) bulk_calls: Mutex<Vec<BulkCall>>,
         write_responses: Mutex<VecDeque<Scripted>>,
         read_responses: Mutex<VecDeque<Scripted>>,
         bulk: Mutex<VecDeque<BulkRead>>,
@@ -262,16 +273,23 @@ pub(crate) mod mock {
 
         fn read_bulk(
             &self,
-            _endpoint: u8,
+            endpoint: u8,
             buf: &mut [u8],
-            _timeout: Duration,
+            timeout: Duration,
         ) -> rusb::Result<usize> {
+            self.bulk_calls.lock().expect("mock lock").push(BulkCall {
+                endpoint,
+                buf_len: buf.len(),
+                timeout,
+            });
             match self.bulk.lock().expect("mock lock").pop_front() {
                 Some(BulkRead::Fill(byte)) => {
                     buf.fill(byte);
                     Ok(buf.len())
                 }
-                Some(BulkRead::Short(n)) => Ok(n.min(buf.len())),
+                // Strictly shorter than the buffer, per the variant's
+                // contract.
+                Some(BulkRead::Short(n)) => Ok(n.min(buf.len().saturating_sub(1))),
                 Some(BulkRead::Fail(e)) => Err(e),
                 // Exhausted script: keep the stream alive via the
                 // tolerated timeout path (brief sleep avoids a busy

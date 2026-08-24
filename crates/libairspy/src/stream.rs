@@ -638,6 +638,16 @@ mod tests {
         device.stop_rx().expect("stop");
         assert!(!device.is_streaming());
 
+        // Every bulk read used the C endpoint, buffer size, and
+        // timeout.
+        let bulk = transport.bulk_calls.lock().expect("mock lock").clone();
+        assert!(!bulk.is_empty());
+        for call in &bulk {
+            assert_eq!(call.endpoint, BULK_ENDPOINT);
+            assert_eq!(call.buf_len, BUFFER_SIZE);
+            assert_eq!(call.timeout, EVENT_TIMEOUT);
+        }
+
         let modes: Vec<(u8, u16)> = transport
             .take_recorded()
             .into_iter()
