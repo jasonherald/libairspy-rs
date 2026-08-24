@@ -113,6 +113,10 @@ pub(crate) mod mock {
         pub(crate) const VENDOR_IN: u8 = 0xC0;
         /// `LIBUSB_CTRL_TIMEOUT_MS = 500` (airspy.c).
         pub(crate) const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
+        /// The samplerate fallback pair `airspy_open_init` installs
+        /// when the firmware query fails: `{10000000, 2500000}`
+        /// (airspy.c).
+        pub(crate) const FALLBACK_SAMPLERATES: [u32; 2] = [10_000_000, 2_500_000];
     }
 
     /// Poll delay served while the bulk script is exhausted — a

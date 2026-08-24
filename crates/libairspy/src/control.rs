@@ -144,7 +144,9 @@ mod tests {
     #[test]
     fn from_transport_falls_back_when_query_fails() {
         let (_, device) = mock_device();
-        // Fallback pair {10, 2.5} MSPS, undoubled for the IQ default.
-        assert_eq!(device.samplerates(), vec![10_000_000, 2_500_000]);
+        // The C fallback pair, undoubled for the IQ default; asserted
+        // against the independent wire transcription so production
+        // drift is caught.
+        assert_eq!(device.samplerates(), wire::FALLBACK_SAMPLERATES.to_vec());
     }
 }
