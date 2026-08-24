@@ -17,6 +17,7 @@ pub mod commands;
 pub mod conversion;
 pub mod device;
 pub mod error;
+pub mod reader;
 pub mod stream;
 mod transfer;
 
