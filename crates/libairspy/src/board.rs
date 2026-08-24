@@ -66,9 +66,12 @@ impl Device {
     pub fn board_id(&self) -> Result<u8> {
         let mut value = [0u8; 1];
         let n = self.vendor_in(Command::BoardIdRead, 0, 0, &mut value)?;
-        if n < 1 {
+        if n < value.len() {
             // C: result < 1 → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::Usb(rusb::Error::Other));
+            return Err(Error::TransferLengthMismatch {
+                expected: value.len(),
+                actual: n,
+            });
         }
         Ok(value[0])
     }
@@ -93,7 +96,10 @@ impl Device {
         let n = self.vendor_in(Command::BoardPartIdSerialNoRead, 0, 0, &mut raw)?;
         if n < PARTID_SERIALNO_LEN {
             // C: result < length → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::Usb(rusb::Error::Other));
+            return Err(Error::TransferLengthMismatch {
+                expected: PARTID_SERIALNO_LEN,
+                actual: n,
+            });
         }
         Ok(PartIdSerial::from_le_bytes(&raw))
     }

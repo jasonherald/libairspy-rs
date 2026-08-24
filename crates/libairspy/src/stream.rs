@@ -25,6 +25,7 @@ use crate::commands::{Command, ReceiverMode, SampleType};
 use crate::conversion::{Samples, Scratch, convert_block};
 use crate::device::Device;
 use crate::error::{Error, Result};
+use crate::transfer::NO_WINDEX;
 
 /// `RAW_BUFFER_COUNT` in airspy.c — slots in the received-samples ring.
 pub(crate) const RAW_BUFFER_COUNT: usize = 8;
@@ -312,10 +313,16 @@ impl Device {
     /// `airspy_set_receiver_mode`: `AIRSPY_RECEIVER_MODE` with the
     /// mode in wValue.
     fn set_receiver_mode(&self, mode: ReceiverMode) -> Result<()> {
-        let n = self.vendor_out(Command::ReceiverMode, mode as u16, 0, &[])?;
-        if n != 0 {
-            // C: result != 0 → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::Usb(rusb::Error::Other));
+        // airspy_set_receiver_mode sends no payload (NULL, 0).
+        let payload: [u8; 0] = [];
+        let n = self.vendor_out(Command::ReceiverMode, mode as u16, NO_WINDEX, &payload)?;
+        if n != payload.len() {
+            // C: result != 0 → AIRSPY_ERROR_LIBUSB (an empty request
+            // that reports transferred bytes is a protocol mismatch).
+            return Err(Error::TransferLengthMismatch {
+                expected: payload.len(),
+                actual: n,
+            });
         }
         Ok(())
     }

@@ -31,6 +31,21 @@ pub enum Error {
     /// `AIRSPY_ERROR_LIBUSB` (-1000), carrying the underlying USB error.
     #[error("AIRSPY_ERROR_LIBUSB (-1000): {0}")]
     Usb(#[from] rusb::Error),
+    /// A control transfer moved a different byte count than the
+    /// request required — usually short, but C's `result != 0` check
+    /// on empty requests also lands here with `actual > expected`.
+    /// C folds all of these into `AIRSPY_ERROR_LIBUSB`; the port keeps
+    /// that code/name for reporting parity while preserving the byte
+    /// counts (more-correct deviation).
+    #[error(
+        "AIRSPY_ERROR_LIBUSB (-1000): transfer length mismatch, {actual} bytes (expected {expected})"
+    )]
+    TransferLengthMismatch {
+        /// Bytes the request required.
+        expected: usize,
+        /// Bytes actually transferred.
+        actual: usize,
+    },
     /// `AIRSPY_ERROR_THREAD` (-1001)
     #[error("AIRSPY_ERROR_THREAD (-1001): worker thread failure")]
     Thread,
@@ -55,7 +70,7 @@ impl Error {
             Self::Busy => -6,
             Self::NoMem => -11,
             Self::Unsupported => -12,
-            Self::Usb(_) => -1000,
+            Self::Usb(_) | Self::TransferLengthMismatch { .. } => -1000,
             Self::Thread => -1001,
             Self::StreamingThread => -1002,
             Self::StreamingStopped => -1003,
@@ -75,7 +90,7 @@ impl Error {
             // airspy_error_name(), so C returns its default string; we
             // replicate that for output parity with the C tools.
             Self::Unsupported => "airspy unknown error",
-            Self::Usb(_) => "AIRSPY_ERROR_LIBUSB",
+            Self::Usb(_) | Self::TransferLengthMismatch { .. } => "AIRSPY_ERROR_LIBUSB",
             Self::Thread => "AIRSPY_ERROR_THREAD",
             Self::StreamingThread => "AIRSPY_ERROR_STREAMING_THREAD_ERR",
             Self::StreamingStopped => "AIRSPY_ERROR_STREAMING_STOPPED",
@@ -126,6 +141,21 @@ mod tests {
             "AIRSPY_ERROR_STREAMING_STOPPED"
         );
         assert_eq!(Error::Other.name(), "AIRSPY_ERROR_OTHER");
+    }
+
+    #[test]
+    fn transfer_length_mismatch_reports_like_c_libusb_error() {
+        // Rust-side precision, C-compatible reporting: a length
+        // mismatch is AIRSPY_ERROR_LIBUSB (-1000) to anything reading
+        // codes/names, while the variant carries the byte counts.
+        let err = Error::TransferLengthMismatch {
+            expected: 4,
+            actual: 1,
+        };
+        assert_eq!(err.code(), -1000);
+        assert_eq!(err.name(), "AIRSPY_ERROR_LIBUSB");
+        let msg = err.to_string();
+        assert!(msg.contains('4') && msg.contains('1'), "got: {msg}");
     }
 
     #[test]

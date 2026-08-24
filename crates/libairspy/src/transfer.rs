@@ -21,9 +21,15 @@ pub(crate) const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 /// LIBUSB_RECIPIENT_DEVICE` — the bmRequestType of every host-to-device
 /// request in airspy.c (0x00 | 0x40 | 0x00) — see e.g.
 /// `airspy_si5351c_write`'s `libusb_control_transfer` call.
-// First consumers are the receiver-mode/setter paths (M2/M4).
-#[allow(dead_code)]
 pub(crate) const VENDOR_OUT_REQUEST_TYPE: u8 = 0x40;
+
+/// Zero `wValue` for requests that carry no value parameter — the
+/// literal `0` wValue argument in e.g. `airspy_set_freq`'s
+/// `libusb_control_transfer` call (airspy.c).
+pub(crate) const NO_WVALUE: u16 = 0;
+/// Zero `wIndex` for requests that carry no index parameter — the
+/// literal `0` wIndex argument in the same C calls.
+pub(crate) const NO_WINDEX: u16 = 0;
 
 /// `LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR |
 /// LIBUSB_RECIPIENT_DEVICE` — the bmRequestType of every device-to-host
@@ -34,8 +40,6 @@ impl Device {
     /// Host-to-device vendor request. Returns the number of bytes
     /// transferred; rusb/libusb errors map to `Error::Usb` (C's
     /// `AIRSPY_ERROR_LIBUSB`).
-    // First consumers are the receiver-mode/setter paths (M2/M4).
-    #[allow(dead_code)]
     pub(crate) fn vendor_out(
         &self,
         command: Command,
