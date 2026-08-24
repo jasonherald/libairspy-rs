@@ -301,16 +301,6 @@ fn run_reader(shared: &StreamShared, handle: &rusb::DeviceHandle<rusb::Context>)
     shared.queue.shutdown();
 }
 
-/// The sample types `start_rx` accepts today. `Float32Iq` returns
-/// [`Error::Unsupported`] until its converter port lands (the last
-/// M3 gate).
-fn validate_stream_sample_type(sample_type: SampleType) -> Result<()> {
-    if matches!(sample_type, SampleType::Float32Iq) {
-        return Err(Error::Unsupported);
-    }
-    Ok(())
-}
-
 /// Worker-thread handles held by a streaming [`Device`].
 pub(crate) struct StreamWorkers {
     pub(crate) shared: Arc<StreamShared>,
@@ -335,8 +325,7 @@ impl Device {
     /// consumer threads. Returns [`Error::Busy`] while streaming.
     ///
     /// The sample type and packing mode are latched here (see
-    /// [`Device::set_sample_type`]). `Float32Iq` returns
-    /// [`Error::Unsupported`] until its converter port lands.
+    /// [`Device::set_sample_type`]); every sample type is supported.
     ///
     /// The callback runs on the consumer thread; return `true` to
     /// keep streaming, `false` to stop (C's nonzero-return stop).
@@ -345,7 +334,6 @@ impl Device {
         callback: impl FnMut(Transfer<'_>) -> bool + Send + 'static,
     ) -> Result<()> {
         let sample_type = self.sample_type();
-        validate_stream_sample_type(sample_type)?;
         let packing_enabled = self.packing_enabled;
         self.reap_finished_workers()?;
         // Converter resets and drop-counter zeroing from
@@ -558,23 +546,6 @@ mod tests {
         std::thread::sleep(core::time::Duration::from_millis(50));
         q.shutdown();
         assert!(waiter.join().expect("join").is_none());
-    }
-
-    #[test]
-    fn start_rx_gate_rejects_float_iq_until_dsp_lands() {
-        assert!(matches!(
-            validate_stream_sample_type(SampleType::Float32Iq),
-            Err(crate::Error::Unsupported)
-        ));
-        for t in [
-            SampleType::Int16Iq,
-            SampleType::Float32Real,
-            SampleType::Int16Real,
-            SampleType::Uint16Real,
-            SampleType::Raw,
-        ] {
-            assert!(validate_stream_sample_type(t).is_ok(), "{t:?} must pass");
-        }
     }
 
     #[test]

@@ -101,12 +101,13 @@ pub(crate) const fn unpacked_sample_count(len: usize) -> usize {
 }
 
 use crate::commands::SampleType;
-use crate::filters::HB_KERNEL_INT16;
+use crate::filters::{HB_KERNEL_FLOAT, HB_KERNEL_INT16};
 
 /// Values per complex sample — IQ slices interleave I and Q, and C
 /// halves `sample_count` for the IQ types (`consumer_threadproc`,
 /// airspy.c).
 const IQ_COMPONENTS: usize = 2;
+use crate::iqconverter_float::IqConverterFloat;
 use crate::iqconverter_int16::IqConverterInt16;
 
 /// `SAMPLE_SHIFT` (airspy.c): `SAMPLE_ENCAPSULATION (16) -
@@ -139,11 +140,11 @@ fn convert_samples_float(src: &[u16], dest: &mut [f32]) {
 /// `void*`.
 #[derive(Debug)]
 pub enum Samples<'a> {
-    /// `AIRSPY_SAMPLE_FLOAT32_REAL` (and, with the DSP milestone,
-    /// `FLOAT32_IQ`).
+    /// `AIRSPY_SAMPLE_FLOAT32_REAL` / `AIRSPY_SAMPLE_FLOAT32_IQ`
+    /// (IQ slices interleave I and Q).
     Float32(&'a [f32]),
-    /// `AIRSPY_SAMPLE_INT16_REAL` (and, with the DSP milestone,
-    /// `INT16_IQ`).
+    /// `AIRSPY_SAMPLE_INT16_REAL` / `AIRSPY_SAMPLE_INT16_IQ`
+    /// (IQ slices interleave I and Q).
     Int16(&'a [i16]),
     /// `AIRSPY_SAMPLE_UINT16_REAL` — raw ADC words.
     Uint16(&'a [u16]),
@@ -162,6 +163,7 @@ pub(crate) struct Scratch {
     out_i16: Vec<i16>,
     out_f32: Vec<f32>,
     cnv_i: IqConverterInt16,
+    cnv_f: IqConverterFloat,
 }
 
 impl Default for Scratch {
@@ -172,6 +174,7 @@ impl Default for Scratch {
             out_i16: Vec::new(),
             out_f32: Vec::new(),
             cnv_i: IqConverterInt16::new(&HB_KERNEL_INT16),
+            cnv_f: IqConverterFloat::new(&HB_KERNEL_FLOAT),
         }
     }
 }
@@ -212,19 +215,14 @@ impl Scratch {
 /// typed samples plus the sample count C would report for the block —
 /// halved for IQ types, whose slices hold `count` interleaved I/Q
 /// pairs (`2 × count` values).
-///
-/// `Float32Iq` is absent until its converter lands (the streaming
-/// engine rejects it at `start_rx`).
 pub(crate) fn convert_block<'a>(
     sample_type: SampleType,
     packing_enabled: bool,
     bytes: &'a [u8],
     scratch: &'a mut Scratch,
 ) -> (Samples<'a>, usize) {
-    // RAW (and the not-yet-supported Float32Iq, which start_rx
-    // refuses and which degrades to RAW delivery here) bypasses all
-    // preparation.
-    if matches!(sample_type, SampleType::Raw | SampleType::Float32Iq) {
+    // RAW bypasses all preparation.
+    if matches!(sample_type, SampleType::Raw) {
         // C sets the packed sample_count before the RAW branch skips
         // unpacking, so a packed RAW stream reports the unpacked
         // count (174762 per full buffer), not bytes/2.
@@ -244,6 +242,7 @@ pub(crate) fn convert_block<'a>(
         out_i16,
         out_f32,
         cnv_i,
+        cnv_f,
     } = scratch;
     let src: &[u16] = if packing_enabled {
         &unpacked[..words_len]
@@ -251,8 +250,15 @@ pub(crate) fn convert_block<'a>(
         &words[..words_len]
     };
     match sample_type {
-        SampleType::Raw | SampleType::Float32Iq => {
-            unreachable!("handled by the early return above")
+        SampleType::Raw => unreachable!("handled by the early return above"),
+        SampleType::Float32Iq => {
+            // C: convert_samples_float → iqconverter_float_process →
+            // sample_count /= 2; complete pairs only, like Int16Iq.
+            out_f32.resize(words_len, 0.0);
+            convert_samples_float(src, out_f32);
+            cnv_f.process(out_f32);
+            let pairs = words_len / IQ_COMPONENTS;
+            (Samples::Float32(&out_f32[..pairs * IQ_COMPONENTS]), pairs)
         }
         SampleType::Int16Iq => {
             // C: convert_samples_int16 → iqconverter_int16_process →
@@ -564,6 +570,42 @@ mod tests {
         assert_eq!(count, 2);
         let Samples::Int16(out) = samples else {
             unreachable!("Int16Iq delivers i16 samples");
+        };
+        assert_eq!(out.len(), 4, "only complete IQ pairs delivered");
+    }
+
+    #[test]
+    fn dispatch_float32_iq_matches_golden_vectors() {
+        use crate::test_vectors::load_scenario;
+        let v = load_scenario("noise");
+        let mut scratch = Scratch::default();
+        for block in 0..3 {
+            let range = block * 2048..(block + 1) * 2048;
+            let bytes: Vec<u8> = v.input[range.clone()]
+                .iter()
+                .flat_map(|&w| w.to_le_bytes())
+                .collect();
+            let (samples, count) =
+                convert_block(SampleType::Float32Iq, false, &bytes, &mut scratch);
+            assert_eq!(count, 1024, "IQ halves the sample count");
+            let Samples::Float32(out) = samples else {
+                unreachable!("Float32Iq delivers f32 samples");
+            };
+            let got: Vec<u32> = out.iter().map(|f| f.to_bits()).collect();
+            let want: Vec<u32> = v.float[range].iter().map(|f| f.to_bits()).collect();
+            assert_eq!(got, want, "block {block} mismatch");
+        }
+    }
+
+    #[test]
+    fn dispatch_float32_iq_delivers_only_complete_pairs() {
+        let packed_tail: [u8; 8] = [0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A];
+        let mut scratch = Scratch::default();
+        let (samples, count) =
+            convert_block(SampleType::Float32Iq, true, &packed_tail, &mut scratch);
+        assert_eq!(count, 2);
+        let Samples::Float32(out) = samples else {
+            unreachable!("Float32Iq delivers f32 samples");
         };
         assert_eq!(out.len(), 4, "only complete IQ pairs delivered");
     }
