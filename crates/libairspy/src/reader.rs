@@ -162,6 +162,13 @@ mod tests {
         assert!(!forward_transfer(&tx, raw_transfer(&[3])));
     }
 
+    /// Bound between "the thread is at the send call-site" (barrier)
+    /// and "the send has parked on the full channel" — there is no
+    /// portable way to observe a parked sender, so this is a settle
+    /// window, not a correctness condition: the assertions below hold
+    /// under either interleaving.
+    const BLOCKED_SEND_SETTLE: core::time::Duration = core::time::Duration::from_millis(50);
+
     #[test]
     fn blocked_forward_unblocks_when_receiver_drops() {
         // The Drop-order regression: a consumer stalled in a full
@@ -169,8 +176,14 @@ mod tests {
         // disconnects, so worker joins can't deadlock.
         let (tx, rx) = mpsc::sync_channel::<OwnedTransfer>(1);
         assert!(forward_transfer(&tx, raw_transfer(&[1]))); // fills the slot
-        let blocked = std::thread::spawn(move || forward_transfer(&tx, raw_transfer(&[2])));
-        std::thread::sleep(core::time::Duration::from_millis(50));
+        let at_send = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let at_send2 = std::sync::Arc::clone(&at_send);
+        let blocked = std::thread::spawn(move || {
+            at_send2.wait();
+            forward_transfer(&tx, raw_transfer(&[2]))
+        });
+        at_send.wait();
+        std::thread::sleep(BLOCKED_SEND_SETTLE);
         drop(rx);
         assert!(
             !blocked.join().expect("join"),
@@ -182,8 +195,14 @@ mod tests {
     fn blocked_forward_delivers_when_receiver_catches_up() {
         let (tx, rx) = mpsc::sync_channel::<OwnedTransfer>(1);
         assert!(forward_transfer(&tx, raw_transfer(&[1])));
-        let blocked = std::thread::spawn(move || forward_transfer(&tx, raw_transfer(&[2])));
-        std::thread::sleep(core::time::Duration::from_millis(50));
+        let at_send = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let at_send2 = std::sync::Arc::clone(&at_send);
+        let blocked = std::thread::spawn(move || {
+            at_send2.wait();
+            forward_transfer(&tx, raw_transfer(&[2]))
+        });
+        at_send.wait();
+        std::thread::sleep(BLOCKED_SEND_SETTLE);
         let first = rx.recv().expect("first");
         assert!(matches!(first.samples, SampleBlock::Raw(ref b) if b.as_slice() == [1]));
         assert!(
