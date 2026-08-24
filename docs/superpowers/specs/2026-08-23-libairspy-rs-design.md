@@ -26,7 +26,14 @@ never be committed**.
   - `airspy.h` — public API (~60 functions)
   - `airspy_commands.h` — vendor-request command enums
   - `iqconverter_float.c` / `iqconverter_int16.c` — IQ conversion DSP
-    (half-band FIR + delay-line Hilbert-style translation)
+    (half-band FIR + delay-line Hilbert-style translation).
+    **Licensing note (2026-08-24):** upstream relicensed these four
+    files on June 10, 2025 to restrictive "Airspy ecosystem only"
+    terms. The port's reference is therefore the last all-MIT
+    revision, airspyone_host commit `bd15be38` (code-identical apart
+    from a FreeBSD build flag); the conversion module and golden
+    vectors derive from it, with MIT attribution in NOTICE. The
+    library crate's license expression is `BSD-3-Clause AND MIT`.
   - `filters.h` — FIR kernel constants
 - `airspy-tools/src/` (GPL-2.0-or-later): `airspy_rx`, `airspy_info`,
   `airspy_gpio`, `airspy_gpiodir`, `airspy_si5351c`, `airspy_r820t`,
@@ -43,7 +50,7 @@ original code:
 
 | Crate dir | Package | License | Contents |
 |---|---|---|---|
-| `crates/libairspy` | `libairspy-rs` | BSD-3-Clause | Library port of libairspy; published to crates.io |
+| `crates/libairspy` | `libairspy-rs` | BSD-3-Clause AND MIT | Library port of libairspy (BSD-3-Clause) with MIT-derived IQ converters; published to crates.io |
 | `crates/airspy-tools` | `airspy-tools` | GPL-2.0-or-later | The 8 CLI tools, clap-based; not published initially |
 
 Root files mirrored from `librtlsdr-rs` / `rtl-sdr`:
