@@ -1,0 +1,7 @@
+# Codacy cloud analysis configuration.
+---
+exclude_paths:
+  # Golden-vector fixtures: generated numeric data, not code (see
+  # test-data/README.md). Excluded so secret-scanning and metric
+  # tools don't chew on tens of thousands of hex/decimal lines.
+  - "test-data/**"

@@ -23,6 +23,8 @@ pub mod stream;
 pub mod stream_smol;
 #[cfg(feature = "tokio")]
 pub mod stream_tokio;
+#[cfg(test)]
+pub(crate) mod test_vectors;
 mod transfer;
 
 pub use board::PartIdSerial;

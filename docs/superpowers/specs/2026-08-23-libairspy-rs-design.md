@@ -26,7 +26,15 @@ never be committed**.
   - `airspy.h` — public API (~60 functions)
   - `airspy_commands.h` — vendor-request command enums
   - `iqconverter_float.c` / `iqconverter_int16.c` — IQ conversion DSP
-    (half-band FIR + delay-line Hilbert-style translation)
+    (half-band FIR + delay-line Hilbert-style translation).
+    **Licensing note (2026-08-24):** upstream relicensed these four
+    files on 2025-06-10 to restrictive "Airspy ecosystem only" terms.
+    The port's reference is therefore the last MIT-licensed revision,
+    airspyone_host commit `126b0a17` (code-identical apart from a
+    FreeBSD build flag); the conversion module and golden vectors
+    derive from it, with MIT attribution in NOTICE. The library crate's
+    license expression becomes `BSD-3-Clause AND MIT` when that code
+    lands.
   - `filters.h` — FIR kernel constants
 - `airspy-tools/src/` (GPL-2.0-or-later): `airspy_rx`, `airspy_info`,
   `airspy_gpio`, `airspy_gpiodir`, `airspy_si5351c`, `airspy_r820t`,
