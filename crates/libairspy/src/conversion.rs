@@ -256,11 +256,15 @@ pub(crate) fn convert_block<'a>(
         }
         SampleType::Int16Iq => {
             // C: convert_samples_int16 → iqconverter_int16_process →
-            // sample_count /= 2.
+            // sample_count /= 2. The converter consumes every word
+            // (state parity with C), but the delivered slice holds
+            // only complete IQ pairs — an odd word count would
+            // otherwise dangle an unpaired I component.
             out_i16.resize(words_len, 0);
             convert_samples_int16(src, out_i16);
             cnv_i.process(out_i16);
-            (Samples::Int16(out_i16), words_len / IQ_COMPONENTS)
+            let pairs = words_len / IQ_COMPONENTS;
+            (Samples::Int16(&out_i16[..pairs * IQ_COMPONENTS]), pairs)
         }
         SampleType::Uint16Real => (Samples::Uint16(src), words_len),
         SampleType::Int16Real => {
@@ -547,6 +551,21 @@ mod tests {
             };
             assert_eq!(out, &v.int16[range], "block {block} mismatch");
         }
+    }
+
+    #[test]
+    fn dispatch_int16_iq_delivers_only_complete_pairs() {
+        // Eight packed bytes decode to five words: the converter
+        // consumes all five, but the callback slice holds two complete
+        // IQ pairs (four values).
+        let packed_tail: [u8; 8] = [0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A];
+        let mut scratch = Scratch::default();
+        let (samples, count) = convert_block(SampleType::Int16Iq, true, &packed_tail, &mut scratch);
+        assert_eq!(count, 2);
+        let Samples::Int16(out) = samples else {
+            unreachable!("Int16Iq delivers i16 samples");
+        };
+        assert_eq!(out.len(), 4, "only complete IQ pairs delivered");
     }
 
     #[test]
