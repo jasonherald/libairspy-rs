@@ -2,9 +2,12 @@
 //! unpacker (`unpack_samples` in airspy.c). The IQ converters land
 //! here with the DSP milestone.
 
+/// Bytes per packed 32-bit word (`uint32_t *input` in
+/// `unpack_samples`, airspy.c).
+const WORD_BYTES: usize = 4;
 /// Bytes consumed per unpacked group — three 32-bit words (`i += 3`
 /// in `unpack_samples`, airspy.c).
-const BYTES_PER_GROUP: usize = 12;
+const BYTES_PER_GROUP: usize = 3 * WORD_BYTES;
 /// Samples produced per group (`j += 8` in `unpack_samples`,
 /// airspy.c).
 const SAMPLES_PER_GROUP: usize = 8;
@@ -60,8 +63,10 @@ pub(crate) fn unpack_samples(input: &[u8], output: &mut [u16]) -> usize {
     // 8-byte tail s0..s4 of the C layout above). This is how the port
     // reaches C's bytes*2/3 count without C's overrun.
     let mut written = groups * SAMPLES_PER_GROUP;
+    // Same bit expressions as the group loop above (s0..s4 of the C
+    // layout), applied to however many complete tail words exist.
     let tail = &input[groups * BYTES_PER_GROUP..];
-    if tail.len() >= 4 {
+    if tail.len() >= WORD_BYTES {
         let w0 = word(tail, 0);
         let mut push = |v: u32| {
             if let Some(slot) = output.get_mut(written) {
@@ -71,7 +76,7 @@ pub(crate) fn unpack_samples(input: &[u8], output: &mut [u16]) -> usize {
         };
         push((w0 >> 20) & 0xFFF);
         push((w0 >> 8) & 0xFFF);
-        if tail.len() >= 8 {
+        if tail.len() >= 2 * WORD_BYTES {
             let w1 = word(tail, 1);
             push(((w0 & 0xFF) << 4) | ((w1 >> 28) & 0xF));
             push((w1 & 0x0FFF_0000) >> 16);
@@ -190,7 +195,15 @@ pub(crate) fn convert_block<'a>(
         sample_type,
         SampleType::Raw | SampleType::Float32Iq | SampleType::Int16Iq
     ) {
-        return (Samples::Raw(bytes), bytes.len() / 2);
+        // C sets the packed sample_count before the RAW branch skips
+        // unpacking, so a packed RAW stream reports the unpacked
+        // count (174762 per full buffer), not bytes/2.
+        let count = if packing_enabled {
+            unpacked_sample_count(bytes.len())
+        } else {
+            bytes.len() / 2
+        };
+        return (Samples::Raw(bytes), count);
     }
     // C: packing_enabled && sample_type != RAW → unpack first.
     let words: &[u16] = if packing_enabled {
@@ -429,8 +442,10 @@ mod tests {
         assert_eq!(count, 8);
         assert!(matches!(samples, Samples::Int16(w) if w == [0i16; 8]));
 
-        // RAW skips the unpack even in packed mode.
-        let (samples, _) = convert_block(SampleType::Raw, true, &packed, &mut scratch);
+        // RAW skips the unpack even in packed mode, but reports the
+        // packed sample count like C (12 bytes → 8).
+        let (samples, count) = convert_block(SampleType::Raw, true, &packed, &mut scratch);
         assert!(matches!(samples, Samples::Raw(b) if b == packed.as_slice()));
+        assert_eq!(count, 8);
     }
 }

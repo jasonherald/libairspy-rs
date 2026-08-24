@@ -308,9 +308,15 @@ impl Device {
     ///
     /// C assigns unconditionally and its consumer reads the field per
     /// buffer (racing any mid-stream change); this port latches the
-    /// type when [`Device::start_rx`] runs — set it before starting.
-    pub fn set_sample_type(&mut self, sample_type: SampleType) {
+    /// type when [`Device::start_rx`] runs, so changing it during an
+    /// active stream is refused with [`Error::Busy`] rather than
+    /// silently deferred.
+    pub fn set_sample_type(&mut self, sample_type: SampleType) -> Result<()> {
+        if self.is_streaming() {
+            return Err(Error::Busy);
+        }
         self.sample_type = sample_type;
+        Ok(())
     }
 
     /// The currently selected sample format.
@@ -534,11 +540,6 @@ mod tests {
             Err(crate::Error::NotFound)
         ));
     }
-}
-
-#[cfg(test)]
-mod samplerate_tests {
-    use super::*;
 
     #[test]
     fn fallback_table_matches_c() {
