@@ -22,6 +22,12 @@ const SIZE_FACTOR: usize = 32;
 /// `SCALE` (`iqconverter_float.c`) — the DC-removal averaging factor.
 const DC_SCALE: f32 = 0.01;
 
+/// The kernel lengths with dedicated symmetric-pair FIR
+/// specializations — the `case 4/8/12/24` labels of
+/// `fir_interleaved`'s switch (`iqconverter_float.c`); other lengths
+/// take the generic path.
+const SYMMETRIC_FIR_LENGTHS: [usize; 4] = [4, 8, 12, 24];
+
 /// `iqconverter_float_t` — the converter's persistent state.
 #[derive(Debug)]
 pub(crate) struct IqConverterFloat {
@@ -152,9 +158,10 @@ impl IqConverterFloat {
     /// share the symmetric-pair form; everything else takes the
     /// generic path.
     fn fir_interleaved(&mut self, samples: &mut [f32]) {
-        match self.fir_kernel.len() {
-            4 | 8 | 12 | 24 => self.fir_symmetric(samples),
-            _ => self.fir_generic(samples),
+        if SYMMETRIC_FIR_LENGTHS.contains(&self.fir_kernel.len()) {
+            self.fir_symmetric(samples);
+        } else {
+            self.fir_generic(samples);
         }
     }
 
@@ -206,9 +213,9 @@ impl IqConverterFloat {
     }
 }
 
-/// Compile-time tie between the stock kernel length and the `len = 24`
-/// FIR specialization the module docs promise.
-const _: () = assert!(HB_KERNEL_FLOAT_LEN / 2 + 1 == 24);
+/// Compile-time tie between the stock kernel length and the largest
+/// FIR specialization (`len = 24`) the module docs promise.
+const _: () = assert!(HB_KERNEL_FLOAT_LEN / 2 + 1 == SYMMETRIC_FIR_LENGTHS[3]);
 
 #[cfg(test)]
 mod tests {
