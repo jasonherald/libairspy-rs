@@ -16,11 +16,12 @@ const SAMPLES_PER_GROUP: usize = 8;
 /// little-endian host; loading through `u32::from_le_bytes` gives the
 /// identical values portably and without alignment requirements.
 ///
-/// Returns the number of samples written. Deviation from C: only
-/// complete 12-byte/8-sample groups are processed. C's loop runs to a
-/// `sample_count` that is not a multiple of 8 (262144-byte buffers
-/// give 174762) and overruns both buffers on the final partial group
-/// — an upstream out-of-bounds this port does not reproduce.
+/// Returns the number of samples written — `input_bytes * 2 / 3`,
+/// matching C's packed `sample_count` (174762 for a 262144-byte
+/// buffer). The final partial group's samples are decoded from its
+/// in-bounds words only; C instead runs its full 8-sample loop body
+/// there, reading past the input and writing past the output (an
+/// upstream out-of-bounds this port does not reproduce).
 // Every assembled value is at most 12 bits ((0xFF << 4) | 0xF =
 // 0xFFF), but clippy cannot prove it through the shift-or pairs.
 #[allow(clippy::cast_possible_truncation)]
@@ -53,7 +54,37 @@ pub(crate) fn unpack_samples(input: &[u8], output: &mut [u16]) -> usize {
         samples[6] = ((w2 >> 12) & 0xFFF) as u16;
         samples[7] = (w2 & 0xFFF) as u16;
     }
-    groups * SAMPLES_PER_GROUP
+
+    // Partial tail: decode the samples fully contained in the
+    // remaining in-bounds words (a 4-byte tail carries s0/s1, an
+    // 8-byte tail s0..s4 of the C layout above). This is how the port
+    // reaches C's bytes*2/3 count without C's overrun.
+    let mut written = groups * SAMPLES_PER_GROUP;
+    let tail = &input[groups * BYTES_PER_GROUP..];
+    if tail.len() >= 4 {
+        let w0 = word(tail, 0);
+        let mut push = |v: u32| {
+            if let Some(slot) = output.get_mut(written) {
+                *slot = v as u16;
+                written += 1;
+            }
+        };
+        push((w0 >> 20) & 0xFFF);
+        push((w0 >> 8) & 0xFFF);
+        if tail.len() >= 8 {
+            let w1 = word(tail, 1);
+            push(((w0 & 0xFF) << 4) | ((w1 >> 28) & 0xF));
+            push((w1 & 0x0FFF_0000) >> 16);
+            push((w1 & 0xFFF0) >> 4);
+        }
+    }
+    written
+}
+
+/// The sample count [`unpack_samples`] yields for `len` packed bytes —
+/// C's `((buffer_size / 2) * 4) / 3` generalized: `len * 2 / 3`.
+pub(crate) const fn unpacked_sample_count(len: usize) -> usize {
+    len * 2 / 3
 }
 
 use crate::commands::SampleType;
@@ -110,6 +141,37 @@ pub(crate) struct Scratch {
     out_f32: Vec<f32>,
 }
 
+impl Scratch {
+    /// Preallocate for a stream delivering `buffer_len`-byte blocks in
+    /// the latched format, so the consumer loop never grows a vector
+    /// on the hot path (C allocates its counterparts at open).
+    pub(crate) fn for_stream(
+        sample_type: SampleType,
+        packing_enabled: bool,
+        buffer_len: usize,
+    ) -> Self {
+        let word_count = if packing_enabled {
+            unpacked_sample_count(buffer_len)
+        } else {
+            buffer_len / 2
+        };
+        let mut scratch = Self::default();
+        if packing_enabled {
+            scratch.unpacked.reserve(word_count);
+        } else {
+            scratch.words.reserve(word_count);
+        }
+        match sample_type {
+            SampleType::Int16Real | SampleType::Int16Iq => scratch.out_i16.reserve(word_count),
+            SampleType::Float32Real | SampleType::Float32Iq => {
+                scratch.out_f32.reserve(word_count);
+            }
+            SampleType::Uint16Real | SampleType::Raw => {}
+        }
+        scratch
+    }
+}
+
 /// The sample-type dispatch from `consumer_threadproc` (airspy.c):
 /// optional 12-bit unpack, then per-type conversion. Returns the
 /// typed samples plus the sample count C would report for the block.
@@ -122,10 +184,19 @@ pub(crate) fn convert_block<'a>(
     bytes: &'a [u8],
     scratch: &'a mut Scratch,
 ) -> (Samples<'a>, usize) {
+    // RAW (and the not-yet-supported IQ types, which start_rx refuses
+    // and which degrade to RAW delivery here) bypass all preparation.
+    if matches!(
+        sample_type,
+        SampleType::Raw | SampleType::Float32Iq | SampleType::Int16Iq
+    ) {
+        return (Samples::Raw(bytes), bytes.len() / 2);
+    }
     // C: packing_enabled && sample_type != RAW → unpack first.
-    let words: &[u16] = if packing_enabled && sample_type != SampleType::Raw {
-        let max = bytes.len() / BYTES_PER_GROUP * SAMPLES_PER_GROUP;
-        scratch.unpacked.resize(max, 0);
+    let words: &[u16] = if packing_enabled {
+        scratch
+            .unpacked
+            .resize(unpacked_sample_count(bytes.len()), 0);
         let n = unpack_samples(bytes, &mut scratch.unpacked);
         &scratch.unpacked[..n]
     } else {
@@ -140,11 +211,8 @@ pub(crate) fn convert_block<'a>(
         &scratch.words
     };
     match sample_type {
-        // IQ conversion arrives with the DSP milestone; start_rx
-        // refuses these types until then, so this arm is unreachable
-        // in practice and degrades to RAW delivery.
         SampleType::Raw | SampleType::Float32Iq | SampleType::Int16Iq => {
-            (Samples::Raw(bytes), bytes.len() / 2)
+            unreachable!("handled by the early return above")
         }
         SampleType::Uint16Real => (Samples::Uint16(words), words.len()),
         SampleType::Int16Real => {
@@ -163,6 +231,7 @@ pub(crate) fn convert_block<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::SampleType;
 
     /// Test-only inverse of the unpacker: pack eight 12-bit samples
     /// into three words exactly as the firmware lays them out
@@ -222,23 +291,40 @@ mod tests {
     }
 
     #[test]
-    fn clamps_to_complete_groups() {
-        // C's loop overruns on a partial tail (sample_count 174762 is
-        // not a multiple of 8 — an upstream OOB); the port processes
-        // complete 3-word/8-sample groups only and reports what it
-        // wrote.
+    fn decodes_partial_tail_without_overrun() {
+        // C's packed count is bytes*2/3 (174762 for a 262144-byte
+        // buffer): the final partial group's in-bounds words carry
+        // real samples. A 4-byte tail yields s0/s1 of that group; an
+        // 8-byte tail yields s0..s4; C's OOB reads for the rest are
+        // not reproduced.
         let mut input = pack_group([9, 8, 7, 6, 5, 4, 3, 2]);
-        // Eight extra bytes: not enough for another 12-byte group.
-        input.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78]);
+        // 4-byte tail: w0 = 0x12345678 → s0=0x123, s1=0x456.
+        input.extend_from_slice(&[0x78, 0x56, 0x34, 0x12]);
         let mut output = [0u16; 16];
-        assert_eq!(unpack_samples(&input, &mut output), 8);
+        assert_eq!(unpack_samples(&input, &mut output), 10);
         assert_eq!(&output[..8], &[9, 8, 7, 6, 5, 4, 3, 2]);
-        // Untouched tail.
-        assert_eq!(&output[8..], &[0u16; 8]);
+        assert_eq!(&output[8..10], &[0x123, 0x456]);
 
-        // Output shorter than the input allows: clamp to output groups.
-        let mut short_out = [0u16; 11]; // one full group only
-        assert_eq!(unpack_samples(&input, &mut short_out), 8);
+        // 8-byte tail: w0=0x12345678, w1=0x9ABCDEF0 → s0..s4.
+        let mut input8 = pack_group([9, 8, 7, 6, 5, 4, 3, 2]);
+        input8.extend_from_slice(&[0x78, 0x56, 0x34, 0x12, 0xF0, 0xDE, 0xBC, 0x9A]);
+        let mut output = [0u16; 16];
+        assert_eq!(unpack_samples(&input8, &mut output), 13);
+        assert_eq!(&output[8..13], &[0x123, 0x456, 0x789, 0xABC, 0xDEF]);
+
+        // Output shorter than available samples: tail fills what fits.
+        let mut short_out = [0u16; 11];
+        assert_eq!(unpack_samples(&input8, &mut short_out), 11);
+        assert_eq!(&short_out[8..], &[0x123, 0x456, 0x789]);
+    }
+
+    #[test]
+    fn full_stream_buffer_matches_c_sample_count() {
+        // 262144-byte packed buffer → C's ((buffer_size/2)*4)/3 =
+        // 174762 samples, now reached without C's overrun.
+        let input = vec![0u8; 262_144];
+        let mut output = vec![0u16; 175_000];
+        assert_eq!(unpack_samples(&input, &mut output), 174_762);
     }
 
     #[test]
@@ -261,12 +347,6 @@ mod tests {
         unpack_samples(&[0u8; 12], &mut output);
         assert_eq!(output, [0u16; 8]);
     }
-}
-
-#[cfg(test)]
-mod convert_tests {
-    use super::*;
-    use crate::commands::SampleType;
 
     #[test]
     fn scale_and_shift_match_c() {
@@ -343,15 +423,7 @@ mod convert_tests {
     fn dispatch_unpacks_before_converting_when_packing_enabled() {
         // consumer_threadproc: packing_enabled && type != RAW → unpack
         // first. One packed group of 2048s converts to eight zeros.
-        let packed: Vec<u8> = {
-            let s: Vec<u32> = std::iter::repeat_n(2048u32, 8).collect();
-            let words = [
-                (s[0] << 20) | (s[1] << 8) | (s[2] >> 4),
-                ((s[2] & 0xF) << 28) | (s[3] << 16) | (s[4] << 4) | (s[5] >> 8),
-                ((s[5] & 0xFF) << 24) | (s[6] << 12) | s[7],
-            ];
-            words.iter().flat_map(|w| w.to_le_bytes()).collect()
-        };
+        let packed = pack_group([2048u16; 8]);
         let mut scratch = Scratch::default();
         let (samples, count) = convert_block(SampleType::Int16Real, true, &packed, &mut scratch);
         assert_eq!(count, 8);

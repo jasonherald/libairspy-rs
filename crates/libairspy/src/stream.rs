@@ -225,7 +225,8 @@ pub(crate) fn run_consumer(
     packing_enabled: bool,
     callback: &mut (impl FnMut(Transfer<'_>) -> bool + ?Sized),
 ) {
-    let mut scratch = Scratch::default();
+    // Preallocated so the hot loop never grows a buffer.
+    let mut scratch = Scratch::for_stream(sample_type, packing_enabled, BUFFER_SIZE);
     while shared.running() {
         let Some((buf, dropped)) = shared.queue.pop_filled() else {
             break;
@@ -300,6 +301,16 @@ fn run_reader(shared: &StreamShared, handle: &rusb::DeviceHandle<rusb::Context>)
     shared.queue.shutdown();
 }
 
+/// The sample types `start_rx` accepts today. The IQ types return
+/// [`Error::Unsupported`] until the iqconverter ports land (M3
+/// removes this gate).
+fn validate_stream_sample_type(sample_type: SampleType) -> Result<()> {
+    if matches!(sample_type, SampleType::Float32Iq | SampleType::Int16Iq) {
+        return Err(Error::Unsupported);
+    }
+    Ok(())
+}
+
 /// Worker-thread handles held by a streaming [`Device`].
 pub(crate) struct StreamWorkers {
     pub(crate) shared: Arc<StreamShared>,
@@ -334,27 +345,9 @@ impl Device {
         callback: impl FnMut(Transfer<'_>) -> bool + Send + 'static,
     ) -> Result<()> {
         let sample_type = self.sample_type();
-        if matches!(sample_type, SampleType::Float32Iq | SampleType::Int16Iq) {
-            // Temporary until the iqconverter ports land (M3).
-            return Err(Error::Unsupported);
-        }
+        validate_stream_sample_type(sample_type)?;
         let packing_enabled = self.packing_enabled;
-        // C gates on `streaming || stop_requested` only, so a device
-        // whose callback stopped the stream can be restarted; reap
-        // finished workers before the busy check.
-        if let Some(mut workers) = self.take_stream_workers() {
-            if workers.shared.running() {
-                self.set_stream_workers(Some(workers));
-                return Err(Error::Busy);
-            }
-            workers.shared.queue.shutdown();
-            if let Some(t) = workers.reader.take() {
-                let _ = t.join();
-            }
-            if let Some(t) = workers.consumer.take() {
-                let _ = t.join();
-            }
-        }
+        self.reap_finished_workers()?;
         // Converter resets and drop-counter zeroing from
         // airspy_start_rx happen via fresh queue/converter state here.
         self.set_receiver_mode(ReceiverMode::Off)?;
@@ -399,6 +392,26 @@ impl Device {
             reader: Some(reader),
             consumer: Some(consumer),
         }));
+        Ok(())
+    }
+
+    /// C gates on `streaming || stop_requested` only, so a device
+    /// whose callback stopped the stream can be restarted; reap any
+    /// finished workers, or report [`Error::Busy`] for a live stream.
+    fn reap_finished_workers(&mut self) -> Result<()> {
+        if let Some(mut workers) = self.take_stream_workers() {
+            if workers.shared.running() {
+                self.set_stream_workers(Some(workers));
+                return Err(Error::Busy);
+            }
+            workers.shared.queue.shutdown();
+            if let Some(t) = workers.reader.take() {
+                let _ = t.join();
+            }
+            if let Some(t) = workers.consumer.take() {
+                let _ = t.join();
+            }
+        }
         Ok(())
     }
 
@@ -545,6 +558,26 @@ mod tests {
         std::thread::sleep(core::time::Duration::from_millis(50));
         q.shutdown();
         assert!(waiter.join().expect("join").is_none());
+    }
+
+    #[test]
+    fn start_rx_gate_rejects_iq_types_until_dsp_lands() {
+        assert!(matches!(
+            validate_stream_sample_type(SampleType::Float32Iq),
+            Err(crate::Error::Unsupported)
+        ));
+        assert!(matches!(
+            validate_stream_sample_type(SampleType::Int16Iq),
+            Err(crate::Error::Unsupported)
+        ));
+        for t in [
+            SampleType::Float32Real,
+            SampleType::Int16Real,
+            SampleType::Uint16Real,
+            SampleType::Raw,
+        ] {
+            assert!(validate_stream_sample_type(t).is_ok(), "{t:?} must pass");
+        }
     }
 
     #[test]

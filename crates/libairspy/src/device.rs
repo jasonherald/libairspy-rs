@@ -51,6 +51,17 @@ const fn serial_filter(serial_number: u64) -> Option<u64> {
 /// the firmware `AIRSPY_GET_SAMPLERATES` query fails.
 const FALLBACK_SAMPLERATES: [u32; 2] = [10_000_000, 2_500_000];
 
+/// `airspy_get_samplerates` (airspy.c): non-IQ sample types — RAW
+/// included — see the firmware rates doubled
+/// (`!SAMPLE_TYPE_IS_IQ(device->sample_type)` → `buffer[i] *= 2`).
+fn rates_for_sample_type(rates: &[u32], sample_type: SampleType) -> Vec<u32> {
+    let is_iq = matches!(sample_type, SampleType::Float32Iq | SampleType::Int16Iq);
+    rates
+        .iter()
+        .map(|&r| if is_iq { r } else { r.saturating_mul(2) })
+        .collect()
+}
+
 /// Cap on the firmware-reported rate count: a control transfer's
 /// wLength is a `u16`, so more than `u16::MAX / 4` words cannot
 /// arrive in one read (`airspy_read_samplerates_from_fw` in airspy.c
@@ -246,16 +257,15 @@ impl Device {
         Err(Error::NotFound)
     }
 
-    /// The supported sample rates cached at open
-    /// (`airspy_get_samplerates`; the C length/count two-call protocol
-    /// collapses into a slice).
+    /// The supported sample rates for the currently selected sample
+    /// type (`airspy_get_samplerates`; the C length/count two-call
+    /// protocol collapses into a Vec).
     ///
-    /// C doubles these values when a real (non-IQ) sample type is
-    /// selected; sample-type selection arrives with the streaming
-    /// engine, which revisits this.
+    /// Like C, every non-IQ type — including RAW — reports the cached
+    /// firmware rates doubled (`!SAMPLE_TYPE_IS_IQ` in airspy.c).
     #[must_use]
-    pub fn samplerates(&self) -> &[u32] {
-        &self.supported_samplerates
+    pub fn samplerates(&self) -> Vec<u32> {
+        rates_for_sample_type(&self.supported_samplerates, self.sample_type)
     }
 
     /// `airspy_read_samplerates_from_fw`: a 4-byte count query
@@ -535,6 +545,32 @@ mod samplerate_tests {
         // airspy_open_init's fallback when the firmware rate query
         // fails: {10000000, 2500000}.
         assert_eq!(FALLBACK_SAMPLERATES, [10_000_000, 2_500_000]);
+    }
+
+    #[test]
+    fn non_iq_types_double_the_rates_like_c() {
+        use crate::commands::SampleType;
+        let rates = [10_000_000, 2_500_000];
+        assert_eq!(
+            rates_for_sample_type(&rates, SampleType::Float32Iq),
+            vec![10_000_000, 2_500_000]
+        );
+        assert_eq!(
+            rates_for_sample_type(&rates, SampleType::Int16Iq),
+            vec![10_000_000, 2_500_000]
+        );
+        for t in [
+            SampleType::Float32Real,
+            SampleType::Int16Real,
+            SampleType::Uint16Real,
+            SampleType::Raw,
+        ] {
+            assert_eq!(
+                rates_for_sample_type(&rates, t),
+                vec![20_000_000, 5_000_000],
+                "non-IQ type {t:?} must double"
+            );
+        }
     }
 
     #[test]
