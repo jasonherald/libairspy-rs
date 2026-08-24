@@ -110,7 +110,7 @@ fn main() {
         for rate in device.samplerates() {
             // C: "\t%f MSPS".
             #[allow(clippy::cast_precision_loss)]
-            let msps = *rate as f32 * HZ_TO_MSPS;
+            let msps = rate as f32 * HZ_TO_MSPS;
             println!("\t{msps:.6} MSPS");
         }
 

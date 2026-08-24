@@ -10,7 +10,7 @@ use rusb::UsbContext as _;
 
 use std::sync::Arc;
 
-use crate::commands::Command;
+use crate::commands::{Command, SampleType};
 use crate::error::{Error, Result};
 use crate::stream::StreamWorkers;
 
@@ -50,6 +50,28 @@ const fn serial_filter(serial_number: u64) -> Option<u64> {
 /// Fallback rate table from `airspy_open_init` (airspy.c), used when
 /// the firmware `AIRSPY_GET_SAMPLERATES` query fails.
 const FALLBACK_SAMPLERATES: [u32; 2] = [10_000_000, 2_500_000];
+
+/// `airspy_get_samplerates` (airspy.c): non-IQ sample types — RAW
+/// included — see the firmware rates doubled
+/// (`!SAMPLE_TYPE_IS_IQ(device->sample_type)` → `buffer[i] *= 2`).
+/// The non-IQ rate multiplier in `airspy_get_samplerates`'s
+/// `buffer[i] *= 2` (airspy.c).
+const NON_IQ_RATE_FACTOR: u32 = 2;
+
+fn rates_for_sample_type(rates: &[u32], sample_type: SampleType) -> Vec<u32> {
+    let is_iq = matches!(sample_type, SampleType::Float32Iq | SampleType::Int16Iq);
+    rates
+        .iter()
+        // wrapping_mul: C's uint32_t multiply wraps on overflow.
+        .map(|&r| {
+            if is_iq {
+                r
+            } else {
+                r.wrapping_mul(NON_IQ_RATE_FACTOR)
+            }
+        })
+        .collect()
+}
 
 /// Cap on the firmware-reported rate count: a control transfer's
 /// wLength is a `u16`, so more than `u16::MAX / 4` words cannot
@@ -175,6 +197,9 @@ pub struct Device {
     handle: Arc<rusb::DeviceHandle<rusb::Context>>,
     supported_samplerates: Vec<u32>,
     workers: Option<StreamWorkers>,
+    sample_type: SampleType,
+    /// `device->packing_enabled` — toggled by the packing setter (M4).
+    pub(crate) packing_enabled: bool,
 }
 
 impl core::fmt::Debug for Device {
@@ -228,6 +253,10 @@ impl Device {
                 handle: Arc::new(handle),
                 supported_samplerates: Vec::new(),
                 workers: None,
+                // airspy_open_init: sample_type = AIRSPY_SAMPLE_FLOAT32_IQ,
+                // packing_enabled = false.
+                sample_type: SampleType::Float32Iq,
+                packing_enabled: false,
             };
             // airspy_open_init caches the firmware rate table at open,
             // falling back to a fixed pair when the query fails.
@@ -239,16 +268,15 @@ impl Device {
         Err(Error::NotFound)
     }
 
-    /// The supported sample rates cached at open
-    /// (`airspy_get_samplerates`; the C length/count two-call protocol
-    /// collapses into a slice).
+    /// The supported sample rates for the currently selected sample
+    /// type (`airspy_get_samplerates`; the C length/count two-call
+    /// protocol collapses into a Vec).
     ///
-    /// C doubles these values when a real (non-IQ) sample type is
-    /// selected; sample-type selection arrives with the streaming
-    /// engine, which revisits this.
+    /// Like C, every non-IQ type — including RAW — reports the cached
+    /// firmware rates doubled (`!SAMPLE_TYPE_IS_IQ` in airspy.c).
     #[must_use]
-    pub fn samplerates(&self) -> &[u32] {
-        &self.supported_samplerates
+    pub fn samplerates(&self) -> Vec<u32> {
+        rates_for_sample_type(&self.supported_samplerates, self.sample_type)
     }
 
     /// `airspy_read_samplerates_from_fw`: a 4-byte count query
@@ -285,6 +313,27 @@ impl Device {
     /// Clone the shared USB handle for the reader thread.
     pub(crate) fn usb_handle_arc(&self) -> Arc<rusb::DeviceHandle<rusb::Context>> {
         Arc::clone(&self.handle)
+    }
+
+    /// Select the delivered sample format (`airspy_set_sample_type`).
+    ///
+    /// C assigns unconditionally and its consumer reads the field per
+    /// buffer (racing any mid-stream change); this port latches the
+    /// type when [`Device::start_rx`] runs, so changing it during an
+    /// active stream is refused with [`Error::Busy`] rather than
+    /// silently deferred.
+    pub fn set_sample_type(&mut self, sample_type: SampleType) -> Result<()> {
+        if self.is_streaming() {
+            return Err(Error::Busy);
+        }
+        self.sample_type = sample_type;
+        Ok(())
+    }
+
+    /// The currently selected sample format.
+    #[must_use]
+    pub fn sample_type(&self) -> SampleType {
+        self.sample_type
     }
 
     /// Streaming worker accessors for `stream.rs`.
@@ -502,17 +551,38 @@ mod tests {
             Err(crate::Error::NotFound)
         ));
     }
-}
-
-#[cfg(test)]
-mod samplerate_tests {
-    use super::*;
 
     #[test]
     fn fallback_table_matches_c() {
         // airspy_open_init's fallback when the firmware rate query
         // fails: {10000000, 2500000}.
         assert_eq!(FALLBACK_SAMPLERATES, [10_000_000, 2_500_000]);
+    }
+
+    #[test]
+    fn non_iq_types_double_the_rates_like_c() {
+        use crate::commands::SampleType;
+        let rates = [10_000_000, 2_500_000];
+        assert_eq!(
+            rates_for_sample_type(&rates, SampleType::Float32Iq),
+            vec![10_000_000, 2_500_000]
+        );
+        assert_eq!(
+            rates_for_sample_type(&rates, SampleType::Int16Iq),
+            vec![10_000_000, 2_500_000]
+        );
+        for t in [
+            SampleType::Float32Real,
+            SampleType::Int16Real,
+            SampleType::Uint16Real,
+            SampleType::Raw,
+        ] {
+            assert_eq!(
+                rates_for_sample_type(&rates, t),
+                vec![20_000_000, 5_000_000],
+                "non-IQ type {t:?} must double"
+            );
+        }
     }
 
     #[test]
