@@ -3,6 +3,7 @@
 use crate::commands::Command;
 use crate::device::Device;
 use crate::error::{Error, Result};
+use crate::transfer::{NO_WINDEX, NO_WVALUE};
 
 impl Device {
     /// Tune the receiver (`airspy_set_freq`): the target frequency in
@@ -14,10 +15,13 @@ impl Device {
     /// the firmware is the authority.
     pub fn set_freq(&self, freq_hz: u32) -> Result<()> {
         let payload = freq_hz.to_le_bytes();
-        let n = self.vendor_out(Command::SetFreq, 0, 0, &payload)?;
+        let n = self.vendor_out(Command::SetFreq, NO_WVALUE, NO_WINDEX, &payload)?;
         if n < payload.len() {
             // C: result < length → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::Usb(rusb::Error::Other));
+            return Err(Error::ShortTransfer {
+                expected: payload.len(),
+                actual: n,
+            });
         }
         Ok(())
     }

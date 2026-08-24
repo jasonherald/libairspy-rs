@@ -68,7 +68,10 @@ impl Device {
         let n = self.vendor_in(Command::BoardIdRead, 0, 0, &mut value)?;
         if n < 1 {
             // C: result < 1 → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::Usb(rusb::Error::Other));
+            return Err(Error::ShortTransfer {
+                expected: 1,
+                actual: n,
+            });
         }
         Ok(value[0])
     }
@@ -93,7 +96,10 @@ impl Device {
         let n = self.vendor_in(Command::BoardPartIdSerialNoRead, 0, 0, &mut raw)?;
         if n < PARTID_SERIALNO_LEN {
             // C: result < length → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::Usb(rusb::Error::Other));
+            return Err(Error::ShortTransfer {
+                expected: PARTID_SERIALNO_LEN,
+                actual: n,
+            });
         }
         Ok(PartIdSerial::from_le_bytes(&raw))
     }

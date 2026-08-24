@@ -314,8 +314,12 @@ impl Device {
     fn set_receiver_mode(&self, mode: ReceiverMode) -> Result<()> {
         let n = self.vendor_out(Command::ReceiverMode, mode as u16, 0, &[])?;
         if n != 0 {
-            // C: result != 0 → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::Usb(rusb::Error::Other));
+            // C: result != 0 → AIRSPY_ERROR_LIBUSB (an empty request
+            // that reports transferred bytes is a protocol mismatch).
+            return Err(Error::ShortTransfer {
+                expected: 0,
+                actual: n,
+            });
         }
         Ok(())
     }
