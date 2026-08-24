@@ -215,17 +215,22 @@ mod tests {
 
     #[test]
     fn all_sample_block_variants_convert() {
-        for (samples, check) in [
-            (Samples::Float32(&[0.5][..]), 0usize),
-            (Samples::Uint16(&[9][..]), 1),
-            (Samples::Raw(&[8][..]), 2),
+        for (samples, sample_type, check) in [
+            (
+                Samples::Float32(&[0.5][..]),
+                SampleType::Float32Real,
+                0usize,
+            ),
+            (Samples::Uint16(&[9][..]), SampleType::Uint16Real, 1),
+            (Samples::Raw(&[8][..]), SampleType::Raw, 2),
         ] {
             let t = Transfer {
                 samples,
-                sample_type: SampleType::Raw,
+                sample_type,
                 dropped_samples: 0,
             };
             let owned = OwnedTransfer::from(t);
+            assert_eq!(owned.sample_type, sample_type);
             match (check, owned.samples) {
                 (0, SampleBlock::Float32(v)) => assert_eq!(v, vec![0.5]),
                 (1, SampleBlock::Uint16(v)) => assert_eq!(v, vec![9]),
