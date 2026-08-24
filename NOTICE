@@ -7,8 +7,10 @@ https://github.com/airspy/airspyone_host
 
 Two components are ported, and each keeps its upstream license:
 
-libairspy (crates/libairspy, package `libairspy-rs`) — BSD-3-Clause,
-matching the upstream libairspy library:
+libairspy (crates/libairspy, package `libairspy-rs`) — BSD-3-Clause
+AND MIT: the driver core matches upstream libairspy's BSD-3-Clause,
+and the IQ conversion module derives from the MIT-licensed converter
+revision (see below). Core attribution:
 
   Copyright (c) 2013, Michael Ossmann <mike@ossmann.com>
   Copyright (c) 2012, Jared Boone <jared@sharebrained.com>

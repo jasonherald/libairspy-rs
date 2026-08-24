@@ -8,6 +8,26 @@ use std::path::PathBuf;
 /// The committed scenarios.
 pub(crate) const SCENARIOS: [&str; 4] = ["impulse", "dc", "tone", "noise"];
 
+// Fixture-specification constants — the generation contract documented
+// in test-data/README.md (harness values, not C transcriptions).
+/// Three sequential 2048-sample process calls per scenario.
+pub(crate) const VECTOR_LEN: usize = 6144;
+/// 12-bit ADC full scale.
+const ADC_MAX: u16 = 4095;
+/// 12-bit ADC mid scale (zero level).
+const ADC_MID: u16 = 2048;
+/// The impulse scenario's spike position.
+const IMPULSE_INDEX: usize = 100;
+/// The dc scenario's constant word (+0.5 FS).
+const DC_WORD: u16 = 3072;
+/// The tone scenario's period in samples (fs/16 sine).
+const TONE_PERIOD: usize = 16;
+/// Noise LCG (numerical-recipes constants), seed, and 12-bit take.
+const LCG_MULT: u32 = 1_664_525;
+const LCG_INC: u32 = 1_013_904_223;
+const LCG_SEED: u32 = 0x1234_5678;
+const LCG_SHIFT: u32 = 20;
+
 /// One scenario's fixture set.
 pub(crate) struct Vectors {
     /// Raw 12-bit ADC words.
@@ -24,16 +44,14 @@ fn vector_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/iq")
 }
 
-fn read_lines(name: &str, kind: &str) -> Vec<String> {
+// `unreachable!` (not `panic!`) throughout: committed fixtures failing
+// to parse means the repository itself is broken, and `clippy::panic`
+// is denied workspace-wide.
+fn parse_all<T>(name: &str, kind: &str, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
     let path = vector_dir().join(format!("{name}.{kind}.txt"));
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| unreachable!("fixture {} unreadable: {e}", path.display()));
-    text.lines().map(str::to_owned).collect()
-}
-
-fn parse_all<T>(name: &str, kind: &str, parse: impl Fn(&str) -> Option<T>) -> Vec<T> {
-    read_lines(name, kind)
-        .iter()
+    text.lines()
         .enumerate()
         .map(|(i, line)| {
             parse(line)
@@ -62,35 +80,53 @@ mod tests {
     fn all_scenarios_load_with_expected_shape() {
         for name in SCENARIOS {
             let v = load_scenario(name);
-            assert_eq!(v.input.len(), 6144, "{name} input");
-            assert_eq!(v.int16.len(), 6144, "{name} int16");
-            assert_eq!(v.float.len(), 6144, "{name} float");
-            assert!(v.input.iter().all(|&w| w <= 4095), "{name}: 12-bit range");
+            assert_eq!(v.input.len(), VECTOR_LEN, "{name} input");
+            assert_eq!(v.int16.len(), VECTOR_LEN, "{name} int16");
+            assert_eq!(v.float.len(), VECTOR_LEN, "{name} float");
+            assert!(
+                v.input.iter().all(|&w| w <= ADC_MAX),
+                "{name}: 12-bit range"
+            );
         }
     }
 
     #[test]
     fn scenario_contents_match_their_definitions() {
         let impulse = load_scenario("impulse");
-        assert_eq!(impulse.input[100], 4095);
+        assert_eq!(impulse.input[IMPULSE_INDEX], ADC_MAX);
         assert!(
             impulse
                 .input
                 .iter()
                 .enumerate()
-                .all(|(i, &w)| i == 100 || w == 2048)
+                .all(|(i, &w)| i == IMPULSE_INDEX || w == ADC_MID)
         );
 
         let dc = load_scenario("dc");
-        assert!(dc.input.iter().all(|&w| w == 3072));
+        assert!(dc.input.iter().all(|&w| w == DC_WORD));
 
-        // LCG: first word = ((0x12345678 * 1664525 + 1013904223) >> 20) & 0xFFF
+        // The full noise sequence recomputed from the LCG spec.
         let noise = load_scenario("noise");
-        let first = 0x1234_5678u32
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223)
-            >> 20;
-        assert_eq!(u32::from(noise.input[0]), first);
+        let mut s = LCG_SEED;
+        for (i, &w) in noise.input.iter().enumerate() {
+            s = s.wrapping_mul(LCG_MULT).wrapping_add(LCG_INC);
+            assert_eq!(u32::from(w), s >> LCG_SHIFT, "noise word {i}");
+        }
+
+        // Tone: fs/16 half-amplitude sine — strictly periodic, with
+        // the zero crossing at phase 0, the crest (+1024) at period/4,
+        // and the trough (-1024) at 3*period/4.
+        let tone = load_scenario("tone");
+        for i in 0..VECTOR_LEN - TONE_PERIOD {
+            assert_eq!(
+                tone.input[i],
+                tone.input[i + TONE_PERIOD],
+                "tone period at {i}"
+            );
+        }
+        assert_eq!(tone.input[0], ADC_MID);
+        assert_eq!(tone.input[TONE_PERIOD / 4], ADC_MID + 1024);
+        assert_eq!(tone.input[3 * TONE_PERIOD / 4], ADC_MID - 1024);
     }
 
     #[test]

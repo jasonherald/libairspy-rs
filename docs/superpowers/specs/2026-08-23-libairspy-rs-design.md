@@ -51,7 +51,7 @@ original code:
 
 | Crate dir | Package | License | Contents |
 |---|---|---|---|
-| `crates/libairspy` | `libairspy-rs` | BSD-3-Clause | Library port of libairspy; published to crates.io |
+| `crates/libairspy` | `libairspy-rs` | BSD-3-Clause AND MIT | Library port of libairspy (BSD-3-Clause) with MIT-derived IQ converters; published to crates.io |
 | `crates/airspy-tools` | `airspy-tools` | GPL-2.0-or-later | The 8 CLI tools, clap-based; not published initially |
 
 Root files mirrored from `librtlsdr-rs` / `rtl-sdr`:
