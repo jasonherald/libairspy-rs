@@ -7,13 +7,15 @@ verified bit-for-bit (int16) and within documented tolerance (float32).
 ## Provenance and licensing
 
 The generating source is airspyone_host at commit
-`126b0a1709f5a90600c6c991f2e31a835334b333` — the last revision on which
+`bd15be38e91ebaa3e0bebb1e320255bde4ccf059` — the last revision on which
 `iqconverter_float.[ch]` / `iqconverter_int16.[ch]` carry their
-original **MIT license** (Copyright (C) 2014, Youssef Touil). Later
-upstream commits (2025-06-10, "Copyright Update") relicensed those
-files restrictively; this project ports from, and generates vectors
-with, the MIT revision only. Its code bodies are identical to the
-relicensed files apart from a FreeBSD build-flag ifdef.
+original **MIT license** (Copyright (C) 2014, Youssef Touil). Upstream
+"Copyright Update" commits on June 10, 2025 relicensed those files
+restrictively (the first of them already flips iqconverter_int16.c, so
+the reference must predate them all); this project ports from, and
+generates vectors with, the all-MIT revision only. Its code bodies are
+identical to the relicensed files apart from a FreeBSD build-flag
+ifdef.
 
 These vector files are program output, committed as fixtures.
 

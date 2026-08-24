@@ -32,16 +32,17 @@ component and is distributed under that component's license.
 IQ converters (crates/libairspy conversion module, and the golden test
 vectors under test-data/) — derived from the MIT-licensed revision of
 iqconverter_float.[ch] / iqconverter_int16.[ch] at airspyone_host
-commit 126b0a1709f5a90600c6c991f2e31a835334b333:
+commit bd15be38e91ebaa3e0bebb1e320255bde4ccf059:
 
   Copyright (C) 2014, Youssef Touil <youssef@airspy.com>
   Released under the MIT License.
 
-Upstream commits after 2025-06-10 relicensed those files under
-restrictive "Airspy ecosystem" terms; this project deliberately ports
-from, and generates reference vectors with, the earlier MIT revision
-only (whose code is identical apart from a FreeBSD build flag). The
-MIT license text accompanies the ported module.
+Upstream "Copyright Update" commits on June 10, 2025 relicensed those
+files under restrictive "Airspy ecosystem" terms; this project
+deliberately ports from, and generates reference vectors with, the
+last all-MIT revision only (whose code is identical apart from a
+FreeBSD build flag). The MIT license text accompanies the ported
+module.
 
   Copyright (C) 2026 Jason Herald <jason.herald@gmail.com>
   and contributors to the libairspy-rs project

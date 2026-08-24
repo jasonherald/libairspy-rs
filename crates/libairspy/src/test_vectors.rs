@@ -22,6 +22,13 @@ const IMPULSE_INDEX: usize = 100;
 const DC_WORD: u16 = 3072;
 /// The tone scenario's period in samples (fs/16 sine).
 const TONE_PERIOD: usize = 16;
+/// Tone amplitude from the fixture contract in test-data/README.md.
+const TONE_AMPLITUDE: u16 = 1024;
+/// The complete quantized tone period — `lround(2048 + 1024·sin(2πk/16))`
+/// per the generation contract in test-data/README.md.
+const TONE_EXPECTED: [u16; TONE_PERIOD] = [
+    2048, 2440, 2772, 2994, 3072, 2994, 2772, 2440, 2048, 1656, 1324, 1102, 1024, 1102, 1324, 1656,
+];
 /// Noise LCG (numerical-recipes constants), seed, and 12-bit take.
 const LCG_MULT: u32 = 1_664_525;
 const LCG_INC: u32 = 1_013_904_223;
@@ -73,6 +80,7 @@ pub(crate) fn load_scenario(name: &str) -> Vectors {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -113,20 +121,15 @@ mod tests {
             assert_eq!(u32::from(w), s >> LCG_SHIFT, "noise word {i}");
         }
 
-        // Tone: fs/16 half-amplitude sine — strictly periodic, with
-        // the zero crossing at phase 0, the crest (+1024) at period/4,
-        // and the trough (-1024) at 3*period/4.
+        // Tone: every sample checked against the documented 16-value
+        // period, plus the landmark phases spelled out.
         let tone = load_scenario("tone");
-        for i in 0..VECTOR_LEN - TONE_PERIOD {
-            assert_eq!(
-                tone.input[i],
-                tone.input[i + TONE_PERIOD],
-                "tone period at {i}"
-            );
+        for (i, &w) in tone.input.iter().enumerate() {
+            assert_eq!(w, TONE_EXPECTED[i % TONE_PERIOD], "tone sample {i}");
         }
         assert_eq!(tone.input[0], ADC_MID);
-        assert_eq!(tone.input[TONE_PERIOD / 4], ADC_MID + 1024);
-        assert_eq!(tone.input[3 * TONE_PERIOD / 4], ADC_MID - 1024);
+        assert_eq!(tone.input[TONE_PERIOD / 4], ADC_MID + TONE_AMPLITUDE);
+        assert_eq!(tone.input[3 * TONE_PERIOD / 4], ADC_MID - TONE_AMPLITUDE);
     }
 
     #[test]
