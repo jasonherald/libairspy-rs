@@ -18,7 +18,7 @@ impl Device {
         let n = self.vendor_out(Command::SetFreq, NO_WVALUE, NO_WINDEX, &payload)?;
         if n < payload.len() {
             // C: result < length → AIRSPY_ERROR_LIBUSB.
-            return Err(Error::ShortTransfer {
+            return Err(Error::TransferLengthMismatch {
                 expected: payload.len(),
                 actual: n,
             });

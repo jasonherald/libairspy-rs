@@ -24,10 +24,11 @@ pub(crate) const CTRL_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const VENDOR_OUT_REQUEST_TYPE: u8 = 0x40;
 
 /// Zero `wValue` for requests that carry no value parameter — the
-/// literal `0` argument the corresponding C calls pass.
+/// literal `0` wValue argument in e.g. `airspy_set_freq`'s
+/// `libusb_control_transfer` call (airspy.c).
 pub(crate) const NO_WVALUE: u16 = 0;
 /// Zero `wIndex` for requests that carry no index parameter — the
-/// literal `0` argument the corresponding C calls pass.
+/// literal `0` wIndex argument in the same C calls.
 pub(crate) const NO_WINDEX: u16 = 0;
 
 /// `LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR |
