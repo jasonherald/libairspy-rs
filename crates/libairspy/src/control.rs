@@ -29,10 +29,117 @@ impl Device {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::device::Device;
+    use crate::transport::mock::MockTransport;
+
+    /// A Device over a mock transport, with construction-time traffic
+    /// (the samplerate query) already drained.
+    pub(crate) fn mock_device() -> (Arc<MockTransport>, Device) {
+        let transport = Arc::new(MockTransport::default());
+        // Fail the open-time samplerate query so the device takes the
+        // C fallback table deterministically.
+        transport.script(vec![Err(rusb::Error::NoDevice)]);
+        let device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        transport.take_recorded();
+        (transport, device)
+    }
+
     #[test]
     fn freq_payload_is_little_endian() {
         // set_freq_params.freq_hz = TO_LE(freq_hz): 100 MHz on the
         // wire is 00 E1 F5 05.
         assert_eq!(100_000_000u32.to_le_bytes(), [0x00, 0xE1, 0xF5, 0x05]);
+    }
+
+    #[test]
+    fn set_freq_wire_contract() {
+        // The full airspy_set_freq transfer: bmRequestType 0x40,
+        // bRequest AIRSPY_SET_FREQ (13), zero wValue/wIndex, 4-byte
+        // little-endian payload, LIBUSB_CTRL_TIMEOUT_MS.
+        let (transport, device) = mock_device();
+        device.set_freq(100_000_000).expect("set_freq");
+        let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 1);
+        let c = &calls[0];
+        assert_eq!(c.request_type, 0x40);
+        assert_eq!(c.request, 13);
+        assert_eq!((c.value, c.index), (0, 0));
+        assert_eq!(c.data, vec![0x00, 0xE1, 0xF5, 0x05]);
+        assert_eq!(c.timeout, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn set_freq_short_write_maps_to_length_mismatch() {
+        let (transport, device) = mock_device();
+        transport.script(vec![Ok(vec![0u8; 2])]); // 2 of 4 bytes
+        let err = device.set_freq(1).expect_err("short write");
+        assert!(matches!(
+            err,
+            crate::Error::TransferLengthMismatch {
+                expected: 4,
+                actual: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn set_freq_usb_error_passes_through() {
+        let (transport, device) = mock_device();
+        transport.script(vec![Err(rusb::Error::Pipe)]);
+        let err = device.set_freq(1).expect_err("usb error");
+        assert!(matches!(err, crate::Error::Usb(rusb::Error::Pipe)));
+    }
+
+    #[test]
+    fn board_id_read_wire_contract_and_value() {
+        let (transport, device) = mock_device();
+        transport.script(vec![Ok(vec![0u8])]);
+        let id = device.board_id().expect("board id");
+        assert_eq!(id, 0);
+        let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 1);
+        let c = &calls[0];
+        assert_eq!(c.request_type, 0xC0);
+        assert_eq!(c.request, 9); // AIRSPY_BOARD_ID_READ
+        assert_eq!(c.data.len(), 1);
+    }
+
+    #[test]
+    fn stop_rx_sends_receiver_off_even_without_stream() {
+        // airspy_stop_rx sends RECEIVER_MODE_OFF unconditionally.
+        let (transport, mut device) = mock_device();
+        device.stop_rx().expect("stop");
+        let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 1);
+        let c = &calls[0];
+        assert_eq!(c.request, 1); // AIRSPY_RECEIVER_MODE
+        assert_eq!(c.value, 0); // RECEIVER_MODE_OFF
+        assert!(c.data.is_empty());
+    }
+
+    #[test]
+    fn from_transport_caches_scripted_samplerates() {
+        let transport = Arc::new(MockTransport::default());
+        // Count query (4 bytes LE) then the rate list.
+        transport.script(vec![
+            Ok(2u32.to_le_bytes().to_vec()),
+            Ok([6_000_000u32, 3_000_000u32]
+                .iter()
+                .flat_map(|r| r.to_le_bytes())
+                .collect()),
+        ]);
+        let device = Device::from_transport(transport as Arc<_>);
+        // Default type is Float32Iq: rates undoubled.
+        assert_eq!(device.samplerates(), vec![6_000_000, 3_000_000]);
+    }
+
+    #[test]
+    fn from_transport_falls_back_when_query_fails() {
+        let (_, device) = mock_device();
+        // Fallback pair {10, 2.5} MSPS, undoubled for the IQ default.
+        assert_eq!(device.samplerates(), vec![10_000_000, 2_500_000]);
     }
 }

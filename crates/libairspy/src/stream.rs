@@ -258,7 +258,7 @@ pub(crate) fn run_consumer(
 /// The reader half — C's transfer thread plus libusb callback,
 /// collapsed into a synchronous `read_bulk` loop (see the module
 /// docs).
-fn run_reader(shared: &StreamShared, handle: &rusb::DeviceHandle<rusb::Context>) {
+fn run_reader(shared: &StreamShared, handle: &dyn crate::transport::UsbTransport) {
     while shared.running() {
         // Blocks until the consumer recycles a buffer or stop shuts
         // the queue down. While blocked no reads are issued, so USB
@@ -371,7 +371,7 @@ impl Device {
         let reader_handle = self.usb_handle_arc();
         let spawn_result = std::thread::Builder::new()
             .name("airspy-reader".into())
-            .spawn(move || run_reader(&reader_shared, &reader_handle));
+            .spawn(move || run_reader(&reader_shared, reader_handle.as_ref()));
         let Ok(reader) = spawn_result else {
             // Don't orphan the already-running consumer, and switch
             // the receiver off (same hardening as above).

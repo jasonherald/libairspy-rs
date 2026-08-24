@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::commands::{Command, SampleType};
 use crate::error::{Error, Result};
 use crate::stream::StreamWorkers;
+use crate::transport::UsbTransport;
 
 /// USB vendor id (`airspy_usb_vid` in airspy.c).
 pub const AIRSPY_USB_VID: u16 = 0x1d50;
@@ -194,7 +195,7 @@ pub fn list_devices() -> Result<Vec<u64>> {
 /// Dropping the device releases the interface and closes the USB
 /// handle (`airspy_open_exit` semantics).
 pub struct Device {
-    handle: Arc<rusb::DeviceHandle<rusb::Context>>,
+    handle: Arc<dyn UsbTransport>,
     supported_samplerates: Vec<u32>,
     workers: Option<StreamWorkers>,
     sample_type: SampleType,
@@ -204,7 +205,7 @@ pub struct Device {
 
 impl core::fmt::Debug for Device {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // The rusb handle's Debug prints an internal pointer; keep
+        // The transport's Debug may print internal pointers; keep
         // the output stable and address-free.
         f.debug_struct("Device")
             .field("supported_samplerates", &self.supported_samplerates)
@@ -249,21 +250,7 @@ impl Device {
                 // configuration/claim failure.
                 continue;
             }
-            let mut device = Self {
-                handle: Arc::new(handle),
-                supported_samplerates: Vec::new(),
-                workers: None,
-                // airspy_open_init: sample_type = AIRSPY_SAMPLE_FLOAT32_IQ,
-                // packing_enabled = false.
-                sample_type: SampleType::Float32Iq,
-                packing_enabled: false,
-            };
-            // airspy_open_init caches the firmware rate table at open,
-            // falling back to a fixed pair when the query fails.
-            device.supported_samplerates = device
-                .read_samplerates_from_fw()
-                .unwrap_or_else(|_| FALLBACK_SAMPLERATES.to_vec());
-            return Ok(device);
+            return Ok(Self::from_transport(Arc::new(handle)));
         }
         Err(Error::NotFound)
     }
@@ -304,14 +291,36 @@ impl Device {
         Ok(samplerates_from_le_bytes(&raw[..n]))
     }
 
-    /// Borrow the underlying USB handle; the vendor-request layer in
-    /// `transfer.rs` builds on this.
-    pub(crate) fn usb_handle(&self) -> &rusb::DeviceHandle<rusb::Context> {
-        &self.handle
+    /// Complete construction over an already-configured transport:
+    /// `airspy_open_init`'s post-open half — defaults, then the
+    /// samplerate cache with its fixed fallback pair. Test builds use
+    /// this directly with a mock transport.
+    pub(crate) fn from_transport(handle: Arc<dyn UsbTransport>) -> Self {
+        let mut device = Self {
+            handle,
+            supported_samplerates: Vec::new(),
+            workers: None,
+            // airspy_open_init: sample_type = AIRSPY_SAMPLE_FLOAT32_IQ,
+            // packing_enabled = false.
+            sample_type: SampleType::Float32Iq,
+            packing_enabled: false,
+        };
+        // airspy_open_init caches the firmware rate table at open,
+        // falling back to a fixed pair when the query fails.
+        device.supported_samplerates = device
+            .read_samplerates_from_fw()
+            .unwrap_or_else(|_| FALLBACK_SAMPLERATES.to_vec());
+        device
     }
 
-    /// Clone the shared USB handle for the reader thread.
-    pub(crate) fn usb_handle_arc(&self) -> Arc<rusb::DeviceHandle<rusb::Context>> {
+    /// Borrow the underlying USB transport; the vendor-request layer
+    /// in `transfer.rs` builds on this.
+    pub(crate) fn usb_handle(&self) -> &dyn UsbTransport {
+        self.handle.as_ref()
+    }
+
+    /// Clone the shared transport for the reader thread.
+    pub(crate) fn usb_handle_arc(&self) -> Arc<dyn UsbTransport> {
         Arc::clone(&self.handle)
     }
 
