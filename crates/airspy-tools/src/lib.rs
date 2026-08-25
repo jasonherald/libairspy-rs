@@ -5,6 +5,8 @@
 //! holds the argument-parsing and output-formatting code they share.
 #![warn(missing_docs)]
 
+pub mod calib_args;
+pub mod calib_cli;
 pub mod flash_args;
 pub mod flash_cli;
 pub mod gpio_cli;
