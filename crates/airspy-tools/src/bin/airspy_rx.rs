@@ -10,10 +10,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use airspy_tools::rx::{
-    FD_BUFFER_SIZE, RateTracker, WAV_MAX_DATA_BYTES, apply_byte_budget, extend_sample_bytes,
-    frame_count, resolve_display_rate, wav_header_finalized, wav_header_placeholder,
+    FD_BUFFER_SIZE, RateTracker, apply_byte_budget, extend_sample_bytes, frame_count,
+    resolve_display_rate,
 };
 use airspy_tools::rx_cli::{Args, Config, build_config, print_verbose, usage};
+use airspy_tools::wav::{WAV_MAX_DATA_BYTES, wav_header_finalized, wav_header_placeholder};
 use clap::Parser;
 use libairspy_rs::commands::SampleType;
 use libairspy_rs::stream::Transfer;

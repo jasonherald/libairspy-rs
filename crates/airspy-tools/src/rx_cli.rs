@@ -10,9 +10,10 @@ use crate::parse_u64;
 use crate::rx::{
     BIAST_MAX, DEFAULT_FREQ_HZ, DEFAULT_LNA_GAIN, DEFAULT_MIXER_GAIN, DEFAULT_VGA_IF_GAIN,
     FREQ_HZ_MAX, FREQ_HZ_MIN, FREQ_ONE_MHZ, LINEARITY_GAIN_MAX, LNA_GAIN_MAX, MIXER_GAIN_MAX,
-    SAMPLES_TO_XFER_MAX, SENSITIVITY_GAIN_MAX, VGA_GAIN_MAX, WavParams, bytes_to_xfer,
-    parse_freq_mhz, parse_u32, wav_filename,
+    SAMPLES_TO_XFER_MAX, SENSITIVITY_GAIN_MAX, VGA_GAIN_MAX, bytes_to_xfer, parse_freq_mhz,
+    parse_u32,
 };
+use crate::wav::{WavParams, wav_filename};
 
 /// `AIRSPY_RX_VERSION` in `airspy_rx.c`.
 pub const AIRSPY_RX_VERSION: &str = "1.0.5 23 April 2016";

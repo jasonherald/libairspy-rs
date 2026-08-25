@@ -7,6 +7,7 @@
 
 pub mod rx;
 pub mod rx_cli;
+pub mod wav;
 
 /// Failure to parse a `parse_u64`-style argument
 /// (C returns `AIRSPY_ERROR_INVALID_PARAM`).
