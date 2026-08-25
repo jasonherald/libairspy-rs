@@ -48,10 +48,22 @@ impl Device {
     /// the library does not enforce it, and neither does this port —
     /// the firmware is the authority.
     pub fn set_freq(&self, freq_hz: u32) -> Result<()> {
-        let payload = freq_hz.to_le_bytes();
-        let n = self.vendor_out(Command::SetFreq, NO_WVALUE, NO_WINDEX, &payload)?;
-        if n < payload.len() {
-            // C: result < length → AIRSPY_ERROR_LIBUSB.
+        self.out_setter(
+            Command::SetFreq,
+            NO_WVALUE,
+            NO_WINDEX,
+            &freq_hz.to_le_bytes(),
+        )
+    }
+}
+
+impl Device {
+    /// The OUT pattern shared by `set_freq` and the GPIO writes: send
+    /// the payload and require the exact transferred length (C's
+    /// `result != length` checks).
+    fn out_setter(&self, command: Command, value: u16, index: u16, payload: &[u8]) -> Result<()> {
+        let n = self.vendor_out(command, value, index, payload)?;
+        if n != payload.len() {
             return Err(Error::TransferLengthMismatch {
                 expected: payload.len(),
                 actual: n,
@@ -59,9 +71,7 @@ impl Device {
         }
         Ok(())
     }
-}
 
-impl Device {
     /// The IN-with-status pattern most C setters share: a 1-byte read
     /// with the value in `wIndex`, `result < 1` mapping to the libusb
     /// error.
@@ -78,10 +88,16 @@ impl Device {
     }
 
     /// Select the sample rate (`airspy_set_samplerate`): the argument
-    /// is either an index into [`Device::samplerates`]'s table or a
-    /// literal rate in Hz (at or above `MIN_SAMPLERATE_BY_VALUE`).
-    /// Off-table literal rates are sent in kHz, doubled first for IQ
-    /// sample types, exactly as C computes them.
+    /// is either a table index or a literal rate in Hz (at or above
+    /// `MIN_SAMPLERATE_BY_VALUE`).
+    ///
+    /// Like C, literal rates match against the **undoubled firmware
+    /// table** — for non-IQ sample types [`Device::samplerates`]
+    /// reports doubled values, and passing one of those doubled rates
+    /// takes the off-table kHz path rather than matching an index
+    /// (faithful to `airspy_set_samplerate`). Off-table rates are
+    /// doubled for IQ types and sent in kHz, exactly as C computes
+    /// them.
     pub fn set_samplerate(&self, samplerate: u32) -> Result<()> {
         let mut value = samplerate;
         if value >= MIN_SAMPLERATE_BY_VALUE {
@@ -180,15 +196,7 @@ impl Device {
     /// surface lands.
     pub(crate) fn gpio_write(&self, port: GpioPort, pin: GpioPin, value: u8) -> Result<()> {
         let port_pin = u16::from((port as u8) << 5 | pin as u8);
-        let payload: [u8; 0] = [];
-        let n = self.vendor_out(Command::GpioWrite, u16::from(value), port_pin, &payload)?;
-        if n != payload.len() {
-            return Err(Error::TransferLengthMismatch {
-                expected: payload.len(),
-                actual: n,
-            });
-        }
-        Ok(())
+        self.out_setter(Command::GpioWrite, u16::from(value), port_pin, &[])
     }
 
     /// Toggle the bias tee (`airspy_set_rf_bias` — a GPIO write to
@@ -455,6 +463,34 @@ mod tests {
         // port 1 << 5 | pin 13 = 45.
         assert_eq!(c.index, 45);
         assert!(c.data.is_empty());
+    }
+
+    #[test]
+    fn set_packing_busy_while_streaming() {
+        use crate::transport::mock::BulkRead;
+        let (transport, mut device) = mock_device();
+        transport.script_bulk(vec![BulkRead::Fill(0)]);
+        device
+            .set_sample_type(crate::commands::SampleType::Raw)
+            .expect("type");
+        device.start_rx(|_| true).expect("start");
+        assert!(matches!(device.set_packing(true), Err(crate::Error::Busy)));
+        device.stop_rx().expect("stop");
+        assert!(!device.packing_enabled, "flag untouched on Busy");
+    }
+
+    #[test]
+    fn in_setter_zero_length_status_maps_to_length_mismatch() {
+        let (transport, device) = mock_device();
+        transport.script_reads(vec![Ok(vec![])]); // 0 of 1 status byte
+        let err = device.set_lna_gain(1).expect_err("short status");
+        assert!(matches!(
+            err,
+            crate::Error::TransferLengthMismatch {
+                expected: 1,
+                actual: 0
+            }
+        ));
     }
 
     #[test]
