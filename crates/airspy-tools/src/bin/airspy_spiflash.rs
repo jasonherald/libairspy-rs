@@ -5,9 +5,8 @@
 
 use std::io::{Read, Write};
 
-use airspy_tools::flash_cli::{
-    FlashRangeError, MAX_LENGTH, flash_command, transfer_chunks, validate_range,
-};
+use airspy_tools::flash_args::flash_command;
+use airspy_tools::flash_cli::{FlashRangeError, MAX_LENGTH, transfer_chunks, validate_range};
 use airspy_tools::gpio_cli::open_from_matches;
 use libairspy_rs::Device;
 

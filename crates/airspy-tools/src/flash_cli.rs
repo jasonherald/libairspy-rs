@@ -50,12 +50,10 @@ pub fn transfer_chunks(address: u32, length: u32) -> impl Iterator<Item = (u32, 
     })
 }
 
-// The clap builders intentionally follow this module — see the
-// Lizard note below.
-#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flash_args::flash_command;
 
     #[test]
     fn max_length_matches_c_define() {
@@ -118,75 +116,17 @@ mod tests {
                 .try_get_matches_from(["t", "--reset"])
                 .is_err()
         );
+        // Deviation: values past u32 reject instead of C's strtoul
+        // truncation (-a 0x100000000 became address 0 in C).
+        assert!(
+            flash_command()
+                .try_get_matches_from(["t", "-a", "0x100000000", "-r", "f"])
+                .is_err()
+        );
         // --force is the write-confirmation deviation.
         let matches = flash_command()
             .try_get_matches_from(["t", "-w", "fw.bin", "--force"])
             .expect("parse");
         assert!(matches.get_flag("force"));
     }
-}
-
-// NOTE: the clap builders sit below the test module deliberately.
-// Codacy's Lizard mis-lexes Rust char literals (`.short('a')` reads
-// as a lifetime plus a dangling quote), swallowing every following
-// function into one giant measurement; keeping these last confines
-// the confusion to this tail. Fix belongs upstream in Lizard.
-
-/// The `airspy_spiflash` clap command — C's `getopt_long(argc, argv,
-/// "a:l:r:w:s:", long_options, ...)`. The C table's `--reset` entry
-/// is omitted: it has no `case 't'` and no optstring letter, so it
-/// only ever reached C's `opt error` path. `--force` is the
-/// write-confirmation deviation (a `-w` erases and rewrites the
-/// firmware flash).
-pub fn flash_command() -> clap::Command {
-    clap::Command::new("airspy_spiflash")
-        .about("Read and write the Airspy SPI flash")
-        .disable_help_flag(true)
-        .args(range_args())
-        .args(control_args())
-}
-
-/// The `-a`/`-l`/`-r`/`-w` transfer arguments from the C option table.
-/// (Vec rather than an array: the `[T; N]` semicolon in a return
-/// type confuses Lizard's function-boundary parsing.)
-fn range_args() -> Vec<clap::Arg> {
-    vec![
-        clap::Arg::new("address")
-            .short('a')
-            .long("address")
-            .value_name("n")
-            .value_parser(crate::rx::parse_u32)
-            .help("starting address (default: 0)"),
-        clap::Arg::new("length")
-            .short('l')
-            .long("length")
-            .value_name("n")
-            .value_parser(crate::rx::parse_u32)
-            .help("number of bytes to read (default: 0)"),
-        clap::Arg::new("read")
-            .short('r')
-            .long("read")
-            .value_name("filename")
-            .help("Read data into file (SPIFI@0x80000000)"),
-        clap::Arg::new("write")
-            .short('w')
-            .long("write")
-            .value_name("filename")
-            .help("Write data from file"),
-    ]
-}
-
-/// `-s`, `--help`, and the `--force` confirmation deviation.
-fn control_args() -> Vec<clap::Arg> {
-    vec![
-        crate::serial_arg(),
-        clap::Arg::new("help")
-            .long("help")
-            .action(clap::ArgAction::Help)
-            .help("Print help"),
-        clap::Arg::new("force")
-            .long("force")
-            .action(clap::ArgAction::SetTrue)
-            .help("confirm flash writes (-w) — they erase and rewrite the firmware"),
-    ]
 }
