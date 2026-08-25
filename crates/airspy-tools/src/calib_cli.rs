@@ -13,6 +13,10 @@ pub const CALIB_OFFSET: u32 = 0x20000;
 pub const CALIB_HEADER: u32 = 0xCA1B_0001;
 /// `sizeof(airspy_calib_t)` — three packed 32-bit fields.
 pub const CALIB_LEN: usize = 12;
+/// The calibration sector — the literal `2` in
+/// `airspy_spiflash_erase_sector(device, 2)` and the "Erasing
+/// sector 2 (calibration)" message (`airspy_calibrate.c`).
+pub const CALIB_SECTOR: u16 = 2;
 
 /// `airspy_calib_t` in `airspy_calibrate.c`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +89,7 @@ mod tests {
         assert_eq!(CALIB_OFFSET, 0x20000);
         assert_eq!(CALIB_HEADER, 0xCA1B_0001);
         assert_eq!(CALIB_LEN, 12);
+        assert_eq!(CALIB_SECTOR, 2);
     }
 
     #[test]

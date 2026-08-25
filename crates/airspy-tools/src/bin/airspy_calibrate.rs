@@ -4,7 +4,9 @@
 //! diffable.
 
 use airspy_tools::calib_args::calib_command;
-use airspy_tools::calib_cli::{CALIB_HEADER, CALIB_LEN, CALIB_OFFSET, Calib, format_calib_time};
+use airspy_tools::calib_cli::{
+    CALIB_HEADER, CALIB_LEN, CALIB_OFFSET, CALIB_SECTOR, Calib, format_calib_time,
+};
 use libairspy_rs::Device;
 
 /// The C tool's `usage()` (stdout).
@@ -55,7 +57,7 @@ fn read_calibration(device: &Device) -> Result<(), ()> {
 /// printing what will be written first, as C does.
 fn write_calibration(device: &Device, correction_ppb: i32) -> Result<(), ()> {
     println!("Erasing sector 2 (calibration) in SPI flash.");
-    if let Err(_err) = device.spiflash_erase_sector(2) {
+    if let Err(_err) = device.spiflash_erase_sector(CALIB_SECTOR) {
         eprintln!("Failed to erase sector 2.");
         return Err(());
     }
