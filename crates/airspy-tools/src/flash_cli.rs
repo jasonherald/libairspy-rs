@@ -6,8 +6,9 @@
 /// `MAX_LENGTH` in `airspy_spiflash.c` — "8 Mbit flash" (1 MiB).
 pub const MAX_LENGTH: u32 = 0x0010_0000;
 
-/// The 256-byte transfer size in the C read/write loops
-/// (`xfer_len = (tmp_length > 256) ? 256 : tmp_length`).
+/// The 256-byte transfer size in the read and write loops of C
+/// `main()` (`xfer_len = (tmp_length > 256) ? 256 : tmp_length` in
+/// `airspy_spiflash.c`).
 const XFER_CHUNK: u32 = 256;
 
 /// Why a requested range is invalid.
