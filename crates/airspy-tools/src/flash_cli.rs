@@ -65,8 +65,10 @@ pub fn flash_command() -> clap::Command {
 }
 
 /// The `-a`/`-l`/`-r`/`-w` transfer arguments from the C option table.
-fn range_args() -> [clap::Arg; 4] {
-    [
+/// (Vec rather than an array: the `[T; N]` semicolon in a return
+/// type confuses Lizard's function-boundary parsing.)
+fn range_args() -> Vec<clap::Arg> {
+    vec![
         clap::Arg::new("address")
             .short('a')
             .long("address")
@@ -93,8 +95,8 @@ fn range_args() -> [clap::Arg; 4] {
 }
 
 /// `-s`, `--help`, and the `--force` confirmation deviation.
-fn control_args() -> [clap::Arg; 3] {
-    [
+fn control_args() -> Vec<clap::Arg> {
+    vec![
         clap::Arg::new("serial")
             .short('s')
             .value_name("serial_number_64bits")
