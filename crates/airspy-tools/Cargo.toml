@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 libairspy-rs.workspace = true
 clap.workspace = true
+chrono.workspace = true
+ctrlc.workspace = true
 
 [lints]
 workspace = true

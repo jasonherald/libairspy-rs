@@ -23,6 +23,8 @@ tracing = "0.1"
 
 # CLI (airspy-tools)
 clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ctrlc = { version = "3", features = ["termination"] }
 
 # Async-runtime integrations (optional, feature-gated in libairspy-rs;
 # same pattern as librtlsdr-rs)
