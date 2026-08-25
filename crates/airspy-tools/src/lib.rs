@@ -5,6 +5,7 @@
 //! holds the argument-parsing and output-formatting code they share.
 #![warn(missing_docs)]
 
+pub mod flash_cli;
 pub mod gpio_cli;
 pub mod reg_cli;
 pub mod rx;
