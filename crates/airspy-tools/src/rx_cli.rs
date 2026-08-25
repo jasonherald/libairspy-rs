@@ -174,13 +174,16 @@ pub struct Config {
 /// The `-t` value → sample type mapping from the C switch (`None` is
 /// the out-of-range marker checked later).
 fn sample_type_from_u32(value: u32) -> Option<SampleType> {
+    // The switch (sample_type_u32) cases 0..=5 in `airspy_rx.c`
+    // `main()`'s -t handler; the guards tie each case to the enum
+    // discriminant instead of repeating the literal.
     match value {
-        0 => Some(SampleType::Float32Iq),
-        1 => Some(SampleType::Float32Real),
-        2 => Some(SampleType::Int16Iq),
-        3 => Some(SampleType::Int16Real),
-        4 => Some(SampleType::Uint16Real),
-        5 => Some(SampleType::Raw),
+        v if v == SampleType::Float32Iq as u32 => Some(SampleType::Float32Iq),
+        v if v == SampleType::Float32Real as u32 => Some(SampleType::Float32Real),
+        v if v == SampleType::Int16Iq as u32 => Some(SampleType::Int16Iq),
+        v if v == SampleType::Int16Real as u32 => Some(SampleType::Int16Real),
+        v if v == SampleType::Uint16Real as u32 => Some(SampleType::Uint16Real),
+        v if v == SampleType::Raw as u32 => Some(SampleType::Raw),
         _ => None,
     }
 }

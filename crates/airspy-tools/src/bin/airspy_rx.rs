@@ -10,14 +10,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use airspy_tools::rx::{
-    FD_BUFFER_SIZE, RateTracker, extend_sample_bytes, frame_count, resolve_display_rate,
-    wav_header_finalized, wav_header_placeholder,
+    FD_BUFFER_SIZE, RateTracker, WAV_MAX_DATA_BYTES, extend_sample_bytes, frame_count,
+    resolve_display_rate, wav_header_finalized, wav_header_placeholder,
 };
 use airspy_tools::rx_cli::{Args, Config, build_config, print_verbose, usage};
 use clap::Parser;
 use libairspy_rs::commands::SampleType;
 use libairspy_rs::stream::Transfer;
 use libairspy_rs::{Device, Error};
+
+/// The `0.000001f` Hz→MSPS factor in the C tool's verbose
+/// `sample_rate -a` print (`airspy_rx.c` `main()`).
+const HZ_TO_MSPS: f64 = 0.000_001;
 
 /// One second — the C main loop's `sleep(1)` cadence.
 const LOOP_SLEEP: std::time::Duration = std::time::Duration::from_secs(1);
@@ -35,10 +39,14 @@ fn print_error(context: &str, err: &Error) {
 struct RxShared {
     writer: Option<Box<dyn Write + Send>>,
     tracker: RateTracker,
-    /// Remaining byte budget when `-n` was given.
+    /// Remaining byte budget: the `-n` limit, the WAV data cap, or
+    /// both (minimum).
     remaining: Option<u64>,
     /// Reused per-block byte buffer.
     buf: Vec<u8>,
+    /// Set when an output write failed — the capture is truncated and
+    /// the exit status must be nonzero.
+    write_failed: bool,
 }
 
 /// Lock the shared state, recovering from a poisoned mutex (a panic
@@ -81,6 +89,9 @@ fn on_transfer(
         return false;
     };
     if writer.write_all(&state.buf[..bytes_to_write]).is_err() {
+        // Recorded so the exit status reflects the truncated capture
+        // (C's write-error stop keeps returning EXIT_SUCCESS).
+        state.write_failed = true;
         return false;
     }
     // C: stop once the byte budget is exhausted.
@@ -112,7 +123,7 @@ fn print_samplerate(config: &Config, wav_sample_per_sec: u32) {
     eprintln!(
         "sample_rate -a {} ({:.6} MSPS {})",
         config.sample_rate_val,
-        f64::from(wav_sample_per_sec) * 0.000_001,
+        f64::from(wav_sample_per_sec) * HZ_TO_MSPS,
         if config.wav_params.channels == 1 {
             "Real"
         } else {
@@ -245,7 +256,7 @@ fn apply_gains(device: &Device, config: &Config) {
 /// and — exactly as C does — flip `do_exit` when the `-n` byte budget
 /// empties (C then reports "User cancel, exiting...", the same as a
 /// signal stop).
-fn stream_loop(device: &Device, shared: &Mutex<RxShared>, config: &Config) {
+fn stream_loop(device: &Device, shared: &Mutex<RxShared>) {
     while device.is_streaming() && !DO_EXIT.load(Ordering::SeqCst) {
         let (average_rate, exhausted) = {
             let state = lock_shared(shared);
@@ -255,7 +266,9 @@ fn stream_loop(device: &Device, shared: &Mutex<RxShared>, config: &Config) {
             "Streaming at {:>5} MSPS",
             format!("{:.3}", average_rate * 1e-6)
         );
-        if config.limit_num_samples && exhausted {
+        if exhausted {
+            // C: do_exit = true when the -n budget empties (the WAV
+            // size cap uses the same mechanism).
             DO_EXIT.store(true, Ordering::SeqCst);
         } else {
             std::thread::sleep(LOOP_SLEEP);
@@ -350,11 +363,21 @@ fn run(config: &Config) -> i32 {
         return 1;
     };
 
+    // The -n byte budget, additionally capped at the RIFF size limit
+    // for WAV output so the finalized header stays representable
+    // (deviation: C wraps its uint32_t sizes past 4 GiB).
+    let limit = config.limit_num_samples.then_some(config.bytes_to_xfer);
+    let remaining = if config.receive_wav {
+        Some(limit.map_or(WAV_MAX_DATA_BYTES, |b| b.min(WAV_MAX_DATA_BYTES)))
+    } else {
+        limit
+    };
     let shared = Arc::new(Mutex::new(RxShared {
         writer: Some(writer),
         tracker: RateTracker::new(wav_sample_per_sec as f32),
-        remaining: config.limit_num_samples.then_some(config.bytes_to_xfer),
+        remaining,
         buf: Vec::new(),
+        write_failed: false,
     }));
 
     if config.receive_wav && write_wav_placeholder(config, &shared).is_err() {
@@ -384,7 +407,7 @@ fn run(config: &Config) -> i32 {
 
     eprintln!("Stop with Ctrl-C");
     std::thread::sleep(LOOP_SLEEP);
-    stream_loop(&device, &shared, config);
+    stream_loop(&device, &shared);
     print_summary(config, &shared, started);
 
     if let Err(err) = device.stop_rx() {
@@ -392,41 +415,59 @@ fn run(config: &Config) -> i32 {
     }
     drop(device);
 
-    finalize_output(config, &shared, wav_sample_per_sec);
+    let output_ok = finalize_output(config, &shared, wav_sample_per_sec);
     eprintln!("done");
-    0
+    // Deviation: C returns EXIT_SUCCESS even for truncated or
+    // unfinalized captures; a failed output surfaces as status 1.
+    i32::from(!output_ok)
 }
 
 /// The end-of-main file handling: flush and close the stream, then
 /// for WAV captures rewrite the header with the real sizes (C's
 /// `ftell` + rewind + `fwrite`).
-fn finalize_output(config: &Config, shared: &Mutex<RxShared>, wav_sample_per_sec: u32) {
-    let writer = lock_shared(shared).writer.take();
+fn finalize_output(config: &Config, shared: &Mutex<RxShared>, wav_sample_per_sec: u32) -> bool {
+    let (writer, write_failed) = {
+        let mut state = lock_shared(shared);
+        (state.writer.take(), state.write_failed)
+    };
+    let mut ok = !write_failed;
+    if write_failed {
+        eprintln!("Failed to write file: {}", config.path);
+    }
     if let Some(mut writer) = writer
         && writer.flush().is_err()
     {
         eprintln!("Failed to write file: {}", config.path);
+        ok = false;
     }
 
     if config.receive_wav
         && let Err(message) = rewrite_wav_header(config, wav_sample_per_sec)
     {
         eprintln!("{message}");
+        ok = false;
     }
+    ok
 }
 
-/// Reopen the finished capture and overwrite the 44-byte header. C
-/// stores `ftell`'s position in a `uint32_t`, so files past 4 GiB wrap
-/// the size fields (a WAV format limit); the truncating cast keeps
-/// that behavior.
-#[allow(clippy::cast_possible_truncation)]
+/// Reopen the finished capture and overwrite the 44-byte header.
+/// The streaming budget keeps `-w` files inside the RIFF limit, so
+/// an unrepresentable size here (deviation: C wrapped its `uint32_t`
+/// `ftell` position and wrote corrupt fields) can only mean outside
+/// interference — refuse to finalize rather than truncate.
 fn rewrite_wav_header(config: &Config, wav_sample_per_sec: u32) -> Result<(), String> {
     let fail = || format!("Failed to write file: {}", config.path);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(&config.path)
         .map_err(|_| fail())?;
-    let file_pos = file.metadata().map_err(|_| fail())?.len() as u32;
+    let len = file.metadata().map_err(|_| fail())?.len();
+    let Ok(file_pos) = u32::try_from(len) else {
+        return Err(format!(
+            "{} exceeds the 4 GiB WAV size limit; header left unfinalized",
+            config.path
+        ));
+    };
     let header = wav_header_finalized(file_pos, &config.wav_params, wav_sample_per_sec);
     file.seek(SeekFrom::Start(0)).map_err(|_| fail())?;
     file.write_all(&header).map_err(|_| fail())?;

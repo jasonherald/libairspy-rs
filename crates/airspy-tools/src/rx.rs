@@ -47,6 +47,13 @@ pub const FD_BUFFER_SIZE: usize = 16 * 1024;
 /// chunk + 8-byte data-chunk header, no padding.
 pub const WAV_HEADER_LEN: usize = 44;
 
+/// The most data bytes a classic RIFF/WAV file can carry: the 32-bit
+/// size fields cap the whole file at `u32::MAX` bytes, header
+/// included. C wraps its `uint32_t` `ftell` position past 4 GiB and
+/// writes corrupt size fields; deviation: `-w` captures stop at this
+/// budget so the finalized header is always representable.
+pub const WAV_MAX_DATA_BYTES: u64 = u32::MAX as u64 - WAV_HEADER_LEN as u64;
+
 /// The per-buffer window of the C rate average (`buffer_count == 50`
 /// in `rx_callback`).
 const RATE_WINDOW_BUFFERS: u32 = 50;
@@ -447,6 +454,21 @@ mod tests {
         // RAW: 12 bits, mono (the case 5 branch sets only these two).
         let raw = WavParams::for_sample_type(SampleType::Raw);
         assert_eq!((raw.channels, raw.bits_per_sample), (1, 12));
+    }
+
+    #[test]
+    fn wav_data_budget_keeps_sizes_representable() {
+        // A maximal capture finalizes to file_pos = u32::MAX with
+        // in-range RIFF and data sizes.
+        assert_eq!(
+            WAV_MAX_DATA_BYTES + WAV_HEADER_LEN as u64,
+            u64::from(u32::MAX)
+        );
+        let params = WavParams::for_sample_type(SampleType::Int16Iq);
+        #[allow(clippy::cast_possible_truncation)]
+        let bytes = wav_header_finalized(u32::MAX, &params, 2_500_000);
+        assert_eq!(bytes[4..8], (u32::MAX - 8).to_le_bytes());
+        assert_eq!(bytes[40..44], (u32::MAX - 44).to_le_bytes());
     }
 
     #[test]
