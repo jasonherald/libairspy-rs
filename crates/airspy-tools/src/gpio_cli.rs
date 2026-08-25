@@ -184,32 +184,8 @@ pub fn replay_ops(
     let mut outcome = ReplayOutcome::NoOps;
     for op in ops {
         let ok = match op {
-            GpioOp::Port(raw) => {
-                if let Some(p) = parse_u8(raw).and_then(|v| GPIO_PORTS.get(usize::from(v))) {
-                    // C's case 'p' stores parse_u8's SUCCESS in
-                    // `result`, so a bare -p suppresses usage().
-                    port = Some(*p);
-                    outcome = ReplayOutcome::Completed;
-                    true
-                } else {
-                    out(format!(
-                        "Error parameter -p shall be between {PORT_NUM_MIN} and {PORT_NUM_MAX}"
-                    ));
-                    false
-                }
-            }
-            GpioOp::Pin(raw) => {
-                if let Some(p) = parse_u8(raw).and_then(|v| GPIO_PINS.get(usize::from(v))) {
-                    pin = Some(*p);
-                    outcome = ReplayOutcome::Completed;
-                    true
-                } else {
-                    out(format!(
-                        "Error parameter -n shall be between {PIN_NUM_MIN} and {PIN_NUM_MAX}"
-                    ));
-                    false
-                }
-            }
+            GpioOp::Port(raw) => latch(raw, &GPIO_PORTS, &mut port, &mut outcome, out, "-p"),
+            GpioOp::Pin(raw) => latch(raw, &GPIO_PINS, &mut pin, &mut outcome, out, "-n"),
             GpioOp::Read => {
                 let scope = match (port, pin) {
                     (None, _) => ReadScope::All,
@@ -234,6 +210,62 @@ pub fn replay_ops(
         }
     }
     outcome
+}
+
+/// The shared body of C's `-p`/`-n` cases: parse, range-check
+/// against the table, latch on success — and store `parse_u8`'s
+/// SUCCESS in the outcome, so a bare `-p` suppresses `usage()` just
+/// as C's `result` variable does. The range error prints C's exact
+/// message.
+fn latch<T: Copy>(
+    raw: &str,
+    table: &[T],
+    slot: &mut Option<T>,
+    outcome: &mut ReplayOutcome,
+    out: &mut impl FnMut(String),
+    flag: &str,
+) -> bool {
+    if let Some(value) = parse_u8(raw).and_then(|v| table.get(usize::from(v))) {
+        *slot = Some(*value);
+        *outcome = ReplayOutcome::Completed;
+        true
+    } else {
+        let max = table.len() - 1;
+        out(format!(
+            "Error parameter {flag} shall be between 0 and {max}"
+        ));
+        false
+    }
+}
+
+/// The shared serial-number print and device open from both C tools'
+/// `main()`: the `-s` first-pass print, `airspy_open_sn` vs
+/// `airspy_open`, and the C failure message (stdout) — the caller
+/// prints its usage and exits on `None` (the message has already
+/// been printed here, C-style).
+pub fn open_from_matches(matches: &clap::ArgMatches) -> Option<libairspy_rs::Device> {
+    let serial = matches.get_one::<u64>("serial").copied();
+    if let Some(serial) = serial {
+        println!(
+            "Board serial number to open: 0x{:08X}{:08X}",
+            (serial >> 32) as u32,
+            (serial & 0xFFFF_FFFF) as u32
+        );
+    }
+    let (result, context) = match serial {
+        Some(serial) => (
+            libairspy_rs::Device::open_serial(serial),
+            "airspy_open_sn()",
+        ),
+        None => (libairspy_rs::Device::open(), "airspy_open()"),
+    };
+    match result {
+        Ok(device) => Some(device),
+        Err(err) => {
+            println!("{context} failed: {} ({})", err.name(), err.code());
+            None
+        }
+    }
 }
 
 /// The shared tail of C's `-r`/`-w` cases: on failure print
@@ -485,6 +517,21 @@ mod tests {
         ]);
         assert_eq!(o, ReplayOutcome::Completed);
         assert_eq!(log, ["write Port1 Pin7 255"]);
+    }
+
+    #[test]
+    fn unparseable_write_value_fails_silently_like_c() {
+        // C's case 'w': parse_u8 returns INVALID_PARAM, no message
+        // prints in that arm — the loop just breaks and usage()
+        // follows. No write reaches the device.
+        let (o, log, out) = run(&[
+            GpioOp::Port("0".into()),
+            GpioOp::Pin("1".into()),
+            GpioOp::Write("abc".into()),
+        ]);
+        assert_eq!(o, ReplayOutcome::Failed);
+        assert!(log.is_empty());
+        assert!(out.is_empty());
     }
 
     #[test]

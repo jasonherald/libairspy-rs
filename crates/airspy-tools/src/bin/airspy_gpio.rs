@@ -4,7 +4,7 @@
 
 use airspy_tools::gpio_cli::{
     PIN_NUM_MAX, PIN_NUM_MIN, PORT_NUM_MAX, PORT_NUM_MIN, ReadScope, ReplayOutcome, dump_scope,
-    gpio_command, ops_from_matches, replay_ops,
+    gpio_command, open_from_matches, ops_from_matches, replay_ops,
 };
 use libairspy_rs::commands::{GpioPin, GpioPort};
 use libairspy_rs::{Device, Error};
@@ -87,27 +87,9 @@ fn write_port_pin(device: &Device, port: GpioPort, pin: GpioPin, value: u8) -> R
 fn main() {
     let matches = gpio_command("airspy_gpio", "Read and write Airspy GPIO pins").get_matches();
 
-    // C prints the serial line in its first getopt pass, before open.
-    let serial = matches.get_one::<u64>("serial").copied();
-    if let Some(serial) = serial {
-        println!(
-            "Board serial number to open: 0x{:08X}{:08X}",
-            (serial >> 32) as u32,
-            (serial & 0xFFFF_FFFF) as u32
-        );
-    }
-
-    let open_result = match serial {
-        Some(serial) => (Device::open_serial(serial), "airspy_open_sn()"),
-        None => (Device::open(), "airspy_open()"),
-    };
-    let device = match open_result {
-        (Ok(device), _) => device,
-        (Err(err), context) => {
-            println!("{context} failed: {} ({})", err.name(), err.code());
-            usage();
-            std::process::exit(1);
-        }
+    let Some(device) = open_from_matches(&matches) else {
+        usage();
+        std::process::exit(1);
     };
 
     let ops = ops_from_matches(&matches);
