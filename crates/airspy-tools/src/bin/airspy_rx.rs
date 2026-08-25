@@ -421,10 +421,11 @@ fn main() {
     std::process::exit(run(&config));
 }
 
-/// The device-facing half of C `main()`: open, configure in C's exact
-/// order, stream, and report — every failure prints C's message.
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-fn run(config: &Config) -> i32 {
+/// Open the device and apply the pre-stream configuration in C
+/// `main()`'s exact order: sample type, sample-rate resolution and
+/// set, serial-number print, packing, bias-T. Returns the device and
+/// the resolved WAV/display rate; every failure prints C's message.
+fn open_configured_device(config: &Config) -> Result<(Device, u32), ()> {
     let open_result = match config.serial_number {
         Some(serial) => (Device::open_serial(serial), "airspy_open_sn()"),
         None => (Device::open(), "airspy_open()"),
@@ -433,13 +434,13 @@ fn run(config: &Config) -> i32 {
         (Ok(device), _) => device,
         (Err(err), context) => {
             print_error(context, &err);
-            return 1;
+            return Err(());
         }
     };
 
     if let Err(err) = device.set_sample_type(config.sample_type) {
         print_error("airspy_set_sample_type()", &err);
-        return 1;
+        return Err(());
     }
 
     // C: airspy_get_samplerates count + table read, then the index-
@@ -447,12 +448,12 @@ fn run(config: &Config) -> i32 {
     let rates = device.samplerates();
     let Some(wav_sample_per_sec) = resolve_display_rate(config.sample_rate_val, &rates) else {
         eprintln!("argument error: unsupported sample rate");
-        return 1;
+        return Err(());
     };
 
     if let Err(err) = device.set_samplerate(config.sample_rate_val) {
         print_error("airspy_set_samplerate()", &err);
-        return 1;
+        return Err(());
     }
     if config.verbose {
         eprintln!(
@@ -474,7 +475,7 @@ fn run(config: &Config) -> i32 {
         ),
         Err(err) => {
             print_error("airspy_board_partid_serialno_read()", &err);
-            return 1;
+            return Err(());
         }
     }
 
@@ -482,23 +483,126 @@ fn run(config: &Config) -> i32 {
         && let Err(err) = device.set_packing(config.packing)
     {
         print_error("airspy_set_packing()", &err);
-        return 1;
+        return Err(());
     }
 
     if let Err(err) = device.set_rf_bias(config.biast) {
         print_error("airspy_set_rf_bias()", &err);
-        return 1;
+        return Err(());
     }
 
-    let writer: Box<dyn Write + Send> = if config.path == "-" {
-        Box::new(std::io::BufWriter::with_capacity(
+    Ok((device, wav_sample_per_sec))
+}
+
+/// Create the capture output (C's fopen + `setvbuf`; `-` is stdout).
+fn open_output(config: &Config) -> Result<Box<dyn Write + Send>, ()> {
+    if config.path == "-" {
+        return Ok(Box::new(std::io::BufWriter::with_capacity(
             FD_BUFFER_SIZE,
             std::io::stdout(),
-        ))
-    } else if let Ok(file) = std::fs::File::create(&config.path) {
-        Box::new(std::io::BufWriter::with_capacity(FD_BUFFER_SIZE, file))
+        )));
+    }
+    if let Ok(file) = std::fs::File::create(&config.path) {
+        Ok(Box::new(std::io::BufWriter::with_capacity(
+            FD_BUFFER_SIZE,
+            file,
+        )))
     } else {
         eprintln!("Failed to open file: {}", config.path);
+        Err(())
+    }
+}
+
+/// The gain selection before `airspy_start_rx` — C prints failures
+/// but does not abort.
+#[allow(clippy::cast_possible_truncation)]
+fn apply_gains(device: &Device, config: &Config) {
+    if config.linearity_gain.is_none() && config.sensitivity_gain.is_none() {
+        if let Err(err) = device.set_vga_gain(config.vga_gain as u8) {
+            print_error("airspy_set_vga_gain()", &err);
+        }
+        if let Err(err) = device.set_mixer_gain(config.mixer_gain as u8) {
+            print_error("airspy_set_mixer_gain()", &err);
+        }
+        if let Err(err) = device.set_lna_gain(config.lna_gain as u8) {
+            print_error("airspy_set_lna_gain()", &err);
+        }
+    } else {
+        if let Some(gain) = config.linearity_gain
+            && let Err(err) = device.set_linearity_gain(gain as u8)
+        {
+            print_error("airspy_set_linearity_gain()", &err);
+        }
+        if let Some(gain) = config.sensitivity_gain
+            && let Err(err) = device.set_sensitivity_gain(gain as u8)
+        {
+            print_error("airspy_set_sensitivity_gain()", &err);
+        }
+    }
+}
+
+/// The 1 Hz status loop from C `main()`: print the smoothed rate,
+/// and — exactly as C does — flip `do_exit` when the `-n` byte budget
+/// empties (C then reports "User cancel, exiting...", the same as a
+/// signal stop).
+fn stream_loop(device: &Device, shared: &Mutex<RxShared>, config: &Config) {
+    while device.is_streaming() && !DO_EXIT.load(Ordering::SeqCst) {
+        let (average_rate, exhausted) = {
+            let state = lock_shared(shared);
+            (state.tracker.average_rate, state.remaining == Some(0))
+        };
+        eprintln!(
+            "Streaming at {:>5} MSPS",
+            format!("{:.3}", average_rate * 1e-6)
+        );
+        if config.limit_num_samples && exhausted {
+            DO_EXIT.store(true, Ordering::SeqCst);
+        } else {
+            std::thread::sleep(LOOP_SLEEP);
+        }
+    }
+}
+
+/// The exit summary from C `main()`: cancel/exit message, total time
+/// from the first packet, and the windowed average speed.
+#[allow(clippy::cast_precision_loss)]
+fn print_summary(config: &Config, shared: &Mutex<RxShared>, started: Instant) {
+    if DO_EXIT.load(Ordering::SeqCst) {
+        eprintln!("\nUser cancel, exiting...");
+    } else {
+        eprintln!("\nExiting...");
+    }
+
+    let (total_time, global_average_rate, rate_samples) = {
+        let state = lock_shared(shared);
+        (
+            started.elapsed().as_secs_f64() - state.tracker.t_start.unwrap_or(0.0),
+            state.tracker.global_average_rate,
+            state.tracker.rate_samples,
+        )
+    };
+    eprintln!("Total time: {total_time:5.4} s");
+    if rate_samples > 0 {
+        eprintln!(
+            "Average speed {:2.4} MSPS {}",
+            global_average_rate * 1e-6 / rate_samples as f32,
+            if config.wav_params.channels == 2 {
+                "IQ"
+            } else {
+                "Real"
+            }
+        );
+    }
+}
+
+/// The device-facing half of C `main()`: open, configure, stream, and
+/// report, in C's exact order.
+#[allow(clippy::cast_precision_loss)]
+fn run(config: &Config) -> i32 {
+    let Ok((mut device, wav_sample_per_sec)) = open_configured_device(config) else {
+        return 1;
+    };
+    let Ok(writer) = open_output(config) else {
         return 1;
     };
 
@@ -521,8 +625,9 @@ fn run(config: &Config) -> i32 {
         }
     }
 
-    // C traps INT/ILL/FPE/SEGV/TERM/ABRT; only the catchable
-    // INT/TERM pair maps to a safe Rust handler.
+    // C traps INT/ILL/FPE/SEGV/TERM/ABRT; the ctrlc termination
+    // feature covers the catchable INT/TERM (plus HUP), so a SIGTERM
+    // still finalizes the WAV header below.
     let handler = ctrlc::set_handler(|| {
         eprintln!("Caught signal, exiting...");
         DO_EXIT.store(true, Ordering::SeqCst);
@@ -531,35 +636,7 @@ fn run(config: &Config) -> i32 {
         eprintln!("Failed to install signal handler");
     }
 
-    // C: gain failures print but do not abort.
-    if config.linearity_gain.is_none() && config.sensitivity_gain.is_none() {
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            if let Err(err) = device.set_vga_gain(config.vga_gain as u8) {
-                print_error("airspy_set_vga_gain()", &err);
-            }
-            if let Err(err) = device.set_mixer_gain(config.mixer_gain as u8) {
-                print_error("airspy_set_mixer_gain()", &err);
-            }
-            if let Err(err) = device.set_lna_gain(config.lna_gain as u8) {
-                print_error("airspy_set_lna_gain()", &err);
-            }
-        }
-    } else {
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            if let Some(gain) = config.linearity_gain
-                && let Err(err) = device.set_linearity_gain(gain as u8)
-            {
-                print_error("airspy_set_linearity_gain()", &err);
-            }
-            if let Some(gain) = config.sensitivity_gain
-                && let Err(err) = device.set_sensitivity_gain(gain as u8)
-            {
-                print_error("airspy_set_sensitivity_gain()", &err);
-            }
-        }
-    }
+    apply_gains(&device, config);
 
     let started = Instant::now();
     let callback_shared = Arc::clone(&shared);
@@ -571,57 +648,24 @@ fn run(config: &Config) -> i32 {
         return 1;
     }
 
-    // C sets the frequency after starting the stream.
+    // C sets the frequency after starting the stream. On failure C
+    // exits leaving the WAV placeholder header unwritten (an unusable
+    // file); deviation: stop the stream and finalize the output so
+    // whatever was captured stays readable.
     if let Err(err) = device.set_freq(config.freq_hz) {
         print_error("airspy_set_freq()", &err);
+        if let Err(stop_err) = device.stop_rx() {
+            print_error("airspy_stop_rx()", &stop_err);
+        }
+        drop(device);
+        finalize_output(config, &shared, wav_sample_per_sec);
         return 1;
     }
 
     eprintln!("Stop with Ctrl-C");
     std::thread::sleep(LOOP_SLEEP);
-
-    while device.is_streaming() && !DO_EXIT.load(Ordering::SeqCst) {
-        let (average_rate, exhausted) = {
-            let state = lock_shared(&shared);
-            (state.tracker.average_rate, state.remaining == Some(0))
-        };
-        eprintln!(
-            "Streaming at {:>5} MSPS",
-            format!("{:.3}", average_rate * 1e-6)
-        );
-        if config.limit_num_samples && exhausted {
-            DO_EXIT.store(true, Ordering::SeqCst);
-        } else {
-            std::thread::sleep(LOOP_SLEEP);
-        }
-    }
-
-    if DO_EXIT.load(Ordering::SeqCst) {
-        eprintln!("\nUser cancel, exiting...");
-    } else {
-        eprintln!("\nExiting...");
-    }
-
-    let (total_time, global_average_rate, rate_samples) = {
-        let state = lock_shared(&shared);
-        (
-            started.elapsed().as_secs_f64() - state.tracker.t_start.unwrap_or(0.0),
-            state.tracker.global_average_rate,
-            state.tracker.rate_samples,
-        )
-    };
-    eprintln!("Total time: {total_time:5.4} s");
-    if rate_samples > 0 {
-        eprintln!(
-            "Average speed {:2.4} MSPS {}",
-            global_average_rate * 1e-6 / rate_samples as f32,
-            if config.wav_params.channels == 2 {
-                "IQ"
-            } else {
-                "Real"
-            }
-        );
-    }
+    stream_loop(&device, &shared, config);
+    print_summary(config, &shared, started);
 
     if let Err(err) = device.stop_rx() {
         print_error("airspy_stop_rx()", &err);

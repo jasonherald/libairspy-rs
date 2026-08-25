@@ -356,18 +356,24 @@ pub fn frame_count(samples: &Samples<'_>, sample_type: SampleType, packing: bool
 /// the sample memory verbatim, which is little-endian on the wire and
 /// in the WAV/raw file formats.
 pub fn extend_sample_bytes(out: &mut Vec<u8>, samples: &Samples<'_>) {
+    // One up-front reservation instead of a capacity check per
+    // element — the caller reuses the buffer, so this is free after
+    // the first block.
     match samples {
         Samples::Float32(s) => {
+            out.reserve(std::mem::size_of_val(*s));
             for v in *s {
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
         Samples::Int16(s) => {
+            out.reserve(std::mem::size_of_val(*s));
             for v in *s {
                 out.extend_from_slice(&v.to_le_bytes());
             }
         }
         Samples::Uint16(s) => {
+            out.reserve(std::mem::size_of_val(*s));
             for v in *s {
                 out.extend_from_slice(&v.to_le_bytes());
             }
