@@ -21,6 +21,7 @@ pub mod error;
 mod filters;
 mod iqconverter_float;
 mod iqconverter_int16;
+mod peripherals;
 pub mod reader;
 pub mod stream;
 #[cfg(feature = "smol")]

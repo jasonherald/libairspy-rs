@@ -61,7 +61,13 @@ impl Device {
     /// The OUT pattern shared by `set_freq` and the GPIO writes: send
     /// the payload and require the exact transferred length (C's
     /// `result != length` checks).
-    fn out_setter(&self, command: Command, value: u16, index: u16, payload: &[u8]) -> Result<()> {
+    pub(crate) fn out_setter(
+        &self,
+        command: Command,
+        value: u16,
+        index: u16,
+        payload: &[u8],
+    ) -> Result<()> {
         let n = self.vendor_out(command, value, index, payload)?;
         if n != payload.len() {
             return Err(Error::TransferLengthMismatch {
@@ -191,10 +197,9 @@ impl Device {
         )
     }
 
-    /// `airspy_gpio_write`: `wValue` carries the level, `wIndex`
-    /// packs `port << 5 | pin`. Crate-internal until the full GPIO
-    /// surface lands.
-    pub(crate) fn gpio_write(&self, port: GpioPort, pin: GpioPin, value: u8) -> Result<()> {
+    /// Write a GPIO level (`airspy_gpio_write`): `wValue` carries the
+    /// level (0 or 1), `wIndex` packs `port << 5 | pin`.
+    pub fn gpio_write(&self, port: GpioPort, pin: GpioPin, value: u8) -> Result<()> {
         let port_pin = u16::from((port as u8) << 5 | pin as u8);
         self.out_setter(Command::GpioWrite, u16::from(value), port_pin, &[])
     }
@@ -222,7 +227,7 @@ impl Device {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use crate::device::Device;

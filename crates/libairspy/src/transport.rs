@@ -125,6 +125,28 @@ pub(crate) mod mock {
         pub(crate) const GPIO_WRITE: u8 = 21;
         /// `AIRSPY_SET_PACKING = 26` (`airspy_commands.h`).
         pub(crate) const SET_PACKING: u8 = 26;
+        /// `AIRSPY_SI5351C_WRITE = 2` (`airspy_commands.h`).
+        pub(crate) const SI5351C_WRITE: u8 = 2;
+        /// `AIRSPY_SI5351C_READ = 3` (`airspy_commands.h`).
+        pub(crate) const SI5351C_READ: u8 = 3;
+        /// `AIRSPY_R820T_WRITE = 4` (`airspy_commands.h`).
+        pub(crate) const R820T_WRITE: u8 = 4;
+        /// `AIRSPY_R820T_READ = 5` (`airspy_commands.h`).
+        pub(crate) const R820T_READ: u8 = 5;
+        /// `AIRSPY_SPIFLASH_ERASE = 6` (`airspy_commands.h`).
+        pub(crate) const SPIFLASH_ERASE: u8 = 6;
+        /// `AIRSPY_SPIFLASH_WRITE = 7` (`airspy_commands.h`).
+        pub(crate) const SPIFLASH_WRITE: u8 = 7;
+        /// `AIRSPY_SPIFLASH_READ = 8` (`airspy_commands.h`).
+        pub(crate) const SPIFLASH_READ: u8 = 8;
+        /// `AIRSPY_GPIO_READ = 22` (`airspy_commands.h`).
+        pub(crate) const GPIO_READ: u8 = 22;
+        /// `AIRSPY_GPIODIR_WRITE = 23` (`airspy_commands.h`).
+        pub(crate) const GPIODIR_WRITE: u8 = 23;
+        /// `AIRSPY_GPIODIR_READ = 24` (`airspy_commands.h`).
+        pub(crate) const GPIODIR_READ: u8 = 24;
+        /// `AIRSPY_SPIFLASH_ERASE_SECTOR = 27` (`airspy_commands.h`).
+        pub(crate) const SPIFLASH_ERASE_SECTOR: u8 = 27;
         /// OUT|VENDOR|DEVICE (airspy.c's host-to-device transfers).
         pub(crate) const VENDOR_OUT: u8 = 0x40;
         /// IN|VENDOR|DEVICE (airspy.c's device-to-host transfers).
