@@ -269,10 +269,10 @@ mod tests {
         for c in &calls {
             assert_eq!(c.request_type, wire::VENDOR_OUT);
             assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
+            assert!(c.data.is_empty());
         }
         assert_eq!(calls[0].request, wire::SPIFLASH_ERASE);
         assert_eq!((calls[0].value, calls[0].index), (0, 0));
-        assert!(calls[0].data.is_empty());
         assert_eq!(calls[1].request, wire::SPIFLASH_ERASE_SECTOR);
         assert_eq!((calls[1].value, calls[1].index), (5, 0));
     }
