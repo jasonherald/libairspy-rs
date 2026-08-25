@@ -5,6 +5,7 @@
 //! holds the argument-parsing and output-formatting code they share.
 #![warn(missing_docs)]
 
+pub mod gpio_cli;
 pub mod rx;
 pub mod rx_cli;
 pub mod wav;
