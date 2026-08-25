@@ -60,55 +60,55 @@ pub fn flash_command() -> clap::Command {
     clap::Command::new("airspy_spiflash")
         .about("Read and write the Airspy SPI flash")
         .disable_help_flag(true)
-        .arg(
-            clap::Arg::new("help")
-                .long("help")
-                .action(clap::ArgAction::Help)
-                .help("Print help"),
-        )
-        .arg(
-            clap::Arg::new("address")
-                .short('a')
-                .long("address")
-                .value_name("n")
-                .value_parser(crate::rx::parse_u32)
-                .help("starting address (default: 0)"),
-        )
-        .arg(
-            clap::Arg::new("length")
-                .short('l')
-                .long("length")
-                .value_name("n")
-                .value_parser(crate::rx::parse_u32)
-                .help("number of bytes to read (default: 0)"),
-        )
-        .arg(
-            clap::Arg::new("read")
-                .short('r')
-                .long("read")
-                .value_name("filename")
-                .help("Read data into file (SPIFI@0x80000000)"),
-        )
-        .arg(
-            clap::Arg::new("write")
-                .short('w')
-                .long("write")
-                .value_name("filename")
-                .help("Write data from file"),
-        )
-        .arg(
-            clap::Arg::new("serial")
-                .short('s')
-                .value_name("serial_number_64bits")
-                .value_parser(crate::parse_u64)
-                .help("Open board with specified 64bits serial number"),
-        )
-        .arg(
-            clap::Arg::new("force")
-                .long("force")
-                .action(clap::ArgAction::SetTrue)
-                .help("confirm flash writes (-w) — they erase and rewrite the firmware"),
-        )
+        .args(range_args())
+        .args(control_args())
+}
+
+/// The `-a`/`-l`/`-r`/`-w` transfer arguments from the C option table.
+fn range_args() -> [clap::Arg; 4] {
+    [
+        clap::Arg::new("address")
+            .short('a')
+            .long("address")
+            .value_name("n")
+            .value_parser(crate::rx::parse_u32)
+            .help("starting address (default: 0)"),
+        clap::Arg::new("length")
+            .short('l')
+            .long("length")
+            .value_name("n")
+            .value_parser(crate::rx::parse_u32)
+            .help("number of bytes to read (default: 0)"),
+        clap::Arg::new("read")
+            .short('r')
+            .long("read")
+            .value_name("filename")
+            .help("Read data into file (SPIFI@0x80000000)"),
+        clap::Arg::new("write")
+            .short('w')
+            .long("write")
+            .value_name("filename")
+            .help("Write data from file"),
+    ]
+}
+
+/// `-s`, `--help`, and the `--force` confirmation deviation.
+fn control_args() -> [clap::Arg; 3] {
+    [
+        clap::Arg::new("serial")
+            .short('s')
+            .value_name("serial_number_64bits")
+            .value_parser(crate::parse_u64)
+            .help("Open board with specified 64bits serial number"),
+        clap::Arg::new("help")
+            .long("help")
+            .action(clap::ArgAction::Help)
+            .help("Print help"),
+        clap::Arg::new("force")
+            .long("force")
+            .action(clap::ArgAction::SetTrue)
+            .help("confirm flash writes (-w) — they erase and rewrite the firmware"),
+    ]
 }
 
 #[cfg(test)]

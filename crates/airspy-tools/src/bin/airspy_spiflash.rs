@@ -94,14 +94,11 @@ fn write_flash(device: &Device, address: u32, data: &[u8]) -> Result<(), ()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn main() {
-    let matches = flash_command().get_matches();
-    let address = matches.get_one::<u32>("address").copied().unwrap_or(0);
-    let mut length = matches.get_one::<u32>("length").copied().unwrap_or(0);
+/// The `if (write == read)` exclusivity check and `--force` gate:
+/// returns the path and whether this is a write.
+fn resolve_operation(matches: &clap::ArgMatches) -> (String, bool) {
     let read_path = matches.get_one::<String>("read");
     let write_path = matches.get_one::<String>("write");
-
     // C: `if (write == read)` — both or neither.
     let path = match (read_path, write_path) {
         (Some(_), Some(_)) => {
@@ -117,7 +114,6 @@ fn main() {
         (Some(path), None) | (None, Some(path)) => path.clone(),
     };
     let writing = write_path.is_some();
-
     // Deviation: a flash write erases and rewrites the firmware, so
     // it requires explicit confirmation (checked before any device
     // or file access; reads are untouched).
@@ -128,39 +124,63 @@ fn main() {
         usage();
         std::process::exit(1);
     }
+    (path, writing)
+}
 
-    // For writes C takes the length from the file size.
-    let mut file_data = Vec::new();
-    if writing {
-        let Ok(mut file) = std::fs::File::open(&path) else {
-            // C: fopen("rb") failure prints to stdout.
-            println!("Error to open file {path}");
-            std::process::exit(1);
-        };
-        if file.read_to_end(&mut file_data).is_err() {
-            eprintln!("Failed read file (read 0 bytes).");
-            std::process::exit(1);
-        }
-        println!("File size {} bytes.", file_data.len());
-        // Deviation: C stores ftell into a uint32_t, so a >4 GiB
-        // file wraps past the size check; the real length is checked
-        // before it ever narrows.
-        if file_data.len() > MAX_LENGTH as usize {
-            print_range_error(
-                FlashRangeError::ExceedsFlash,
-                address,
-                file_data.len() as u64,
-            );
+/// The write-path file staging, in C's exact order: size first (C's
+/// fseek/ftell — metadata here), the "File size" print, the range
+/// checks, and only then a bounded read of exactly `length` bytes.
+/// Validating before reading also bounds the allocation, so an
+/// unbounded input like /dev/zero is rejected at size 0 as in C.
+fn load_write_file(path: &str, address: u32) -> (Vec<u8>, u32) {
+    let Ok(file) = std::fs::File::open(path) else {
+        // C: fopen("rb") failure prints to stdout.
+        println!("Error to open file {path}");
+        std::process::exit(1);
+    };
+    let file_len = file.metadata().map_or(0, |m| m.len());
+    println!("File size {file_len} bytes.");
+    // Deviation: C stores ftell into a uint32_t, so a >4 GiB file
+    // wraps past the size check; the real length is checked before
+    // it ever narrows.
+    let length = match u32::try_from(file_len) {
+        Ok(length) if length <= MAX_LENGTH => length,
+        _ => {
+            print_range_error(FlashRangeError::ExceedsFlash, address, file_len);
             usage();
             std::process::exit(1);
         }
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            length = file_data.len() as u32;
-        }
-    }
-
+    };
     if let Err(error) = validate_range(address, length) {
+        print_range_error(error, address, u64::from(length));
+        usage();
+        std::process::exit(1);
+    }
+    let mut file_data = Vec::with_capacity(length as usize);
+    let read = file
+        .take(u64::from(length))
+        .read_to_end(&mut file_data)
+        .unwrap_or(0);
+    if read != length as usize {
+        // C: fread short count → "Failed read file (read %d bytes)."
+        eprintln!("Failed read file (read {read} bytes).");
+        std::process::exit(1);
+    }
+    (file_data, length)
+}
+
+fn main() {
+    let matches = flash_command().get_matches();
+    let address = matches.get_one::<u32>("address").copied().unwrap_or(0);
+    let mut length = matches.get_one::<u32>("length").copied().unwrap_or(0);
+    let (path, writing) = resolve_operation(&matches);
+
+    // For writes C takes the length from the file size (validated
+    // inside load_write_file, in C's order).
+    let mut file_data = Vec::new();
+    if writing {
+        (file_data, length) = load_write_file(&path, address);
+    } else if let Err(error) = validate_range(address, length) {
         print_range_error(error, address, u64::from(length));
         usage();
         std::process::exit(1);
