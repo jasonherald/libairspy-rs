@@ -61,27 +61,39 @@ pub fn parse_u32(s: &str) -> Result<u32, ParseU64Error> {
     parse_u64(s).map(|v| v as u32)
 }
 
-/// C99's `0x` significand with an optional `p`/`P` binary exponent
-/// (`strtod` accepts e.g. `0x1p10` = 1024.0 and `0x1A` = 26.0):
-/// accumulate the hex digits around the optional point, then scale by
-/// `2^(exponent - 4 * fraction digits)`. `None` when no hex digit
-/// follows the prefix — strtod's longest match is then the bare `0`.
-fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
+/// Accumulate a hex significand (digits around an optional point).
+/// Returns `(mantissa, scale, consumed)` where `scale` is a binary
+/// exponent correction: digits beyond f64 precision shift the scale
+/// up instead of overflowing the mantissa, and fraction digits shift
+/// it down — so a long token like `0x1` + 300 zeros + `p-1193` keeps
+/// its value (128.0) instead of degenerating to `inf * 0 = NaN`.
+/// `None` when no hex digit is present (strtod's no-conversion case).
+fn hex_significand(bytes: &[u8]) -> Option<(f64, i32, usize)> {
+    /// Beyond 2^52 another hex digit no longer fits f64's mantissa.
+    const MANTISSA_CAP: f64 = 4_503_599_627_370_496.0; // 2^52
     let mut mantissa = 0.0f64;
+    let mut scale = 0i32;
     let mut digits = 0usize;
-    let mut frac_digits = 0i32;
     let mut pos = 0usize;
     while let Some(d) = bytes.get(pos).and_then(|b| char::from(*b).to_digit(16)) {
-        mantissa = mantissa * 16.0 + f64::from(d);
+        if mantissa < MANTISSA_CAP {
+            mantissa = mantissa * 16.0 + f64::from(d);
+        } else {
+            // The digit is below f64 precision; keep its place value.
+            scale = scale.saturating_add(4);
+        }
         digits += 1;
         pos += 1;
     }
     if bytes.get(pos) == Some(&b'.') {
         let mut after = pos + 1;
         while let Some(d) = bytes.get(after).and_then(|b| char::from(*b).to_digit(16)) {
-            mantissa = mantissa * 16.0 + f64::from(d);
+            if mantissa < MANTISSA_CAP {
+                mantissa = mantissa * 16.0 + f64::from(d);
+                scale = scale.saturating_sub(4);
+            }
+            // Fraction digits beyond precision are below one ulp.
             digits += 1;
-            frac_digits += 1;
             after += 1;
         }
         // The point joins the token only when digits exist at all
@@ -90,40 +102,54 @@ fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
             pos = after;
         }
     }
-    if digits == 0 {
-        return None;
+    (digits > 0).then_some((mantissa, scale, pos))
+}
+
+/// The optional `p`/`P` binary-exponent suffix; returns the exponent,
+/// or 0 when `p` is absent or followed by no digit (longest match —
+/// a bare `p` is not part of the token).
+fn binary_exponent(bytes: &[u8]) -> i32 {
+    if !matches!(bytes.first(), Some(b'p' | b'P')) {
+        return 0;
     }
-    let mut exponent = 0i32;
-    if matches!(bytes.get(pos), Some(b'p' | b'P')) {
-        let mut exp_pos = pos + 1;
-        let negative_exp = match bytes.get(exp_pos) {
-            Some(b'-') => {
-                exp_pos += 1;
-                true
-            }
-            Some(b'+') => {
-                exp_pos += 1;
-                false
-            }
-            _ => false,
-        };
-        let mut exp_digits = 0usize;
-        let mut value = 0i32;
-        while let Some(d) = bytes.get(exp_pos).and_then(|b| char::from(*b).to_digit(10)) {
-            // Saturating: powi over/underflows to inf/0 exactly as
-            // strtod does for out-of-range exponents.
-            #[allow(clippy::cast_possible_wrap)]
-            let d = d as i32;
-            value = value.saturating_mul(10).saturating_add(d);
-            exp_digits += 1;
-            exp_pos += 1;
+    let mut pos = 1;
+    let negative = match bytes.get(pos) {
+        Some(b'-') => {
+            pos += 1;
+            true
         }
-        // `p` with no digit is not part of the token (longest match).
-        if exp_digits > 0 {
-            exponent = if negative_exp { -value } else { value };
+        Some(b'+') => {
+            pos += 1;
+            false
         }
+        _ => false,
+    };
+    let mut exp_digits = 0usize;
+    let mut value = 0i32;
+    while let Some(d) = bytes.get(pos).and_then(|b| char::from(*b).to_digit(10)) {
+        // Saturating: powi over/underflows to inf/0 exactly as strtod
+        // does for out-of-range exponents.
+        #[allow(clippy::cast_possible_wrap)]
+        let d = d as i32;
+        value = value.saturating_mul(10).saturating_add(d);
+        exp_digits += 1;
+        pos += 1;
     }
-    Some(mantissa * 2.0f64.powi(exponent.saturating_sub(frac_digits.saturating_mul(4))))
+    if exp_digits == 0 {
+        return 0;
+    }
+    if negative { -value } else { value }
+}
+
+/// C99's `0x` significand with an optional `p`/`P` binary exponent
+/// (`strtod` accepts e.g. `0x1p10` = 1024.0 and `0x1A` = 26.0):
+/// the significand's scale correction and the exponent combine into
+/// one `powi`. `None` when no hex digit follows the prefix —
+/// strtod's longest match is then the bare `0`.
+fn hex_float_prefix(bytes: &[u8]) -> Option<f64> {
+    let (mantissa, scale, consumed) = hex_significand(bytes)?;
+    let exponent = binary_exponent(&bytes[consumed..]);
+    Some(mantissa * 2.0f64.powi(exponent.saturating_add(scale)))
 }
 
 /// `strtod(s, NULL)`'s longest-valid-prefix parse over the forms the
@@ -451,6 +477,15 @@ mod tests {
         // Out-of-range binary exponents saturate like strtod's
         // overflow (rejected by the caller's range check either way).
         assert_eq!(parse_freq_mhz("0x1p99999"), u32::MAX);
+        // A long significand must not overflow before the exponent
+        // applies: 0x1 followed by 300 zeros with p-1193 is exactly
+        // 2^(1200 - 1193) = 128.0, i.e. a valid 128 MHz.
+        let long = format!("0x1{}p-1193", "0".repeat(300));
+        assert_eq!(parse_freq_mhz(&long), 128_000_000);
+        // The same shifting on the fraction side: a long fraction
+        // tail below precision does not disturb the value.
+        let frac = format!("0x1.{}p3", "0".repeat(300));
+        assert_eq!(parse_freq_mhz(&frac), 8_000_000);
     }
 
     #[test]
