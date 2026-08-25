@@ -107,6 +107,8 @@ pub(crate) mod mock {
         pub(crate) const SET_FREQ: u8 = 13;
         /// `AIRSPY_BOARD_ID_READ = 9` (`airspy_commands.h`).
         pub(crate) const BOARD_ID_READ: u8 = 9;
+        /// `AIRSPY_GET_SAMPLERATES = 25` (`airspy_commands.h`).
+        pub(crate) const GET_SAMPLERATES: u8 = 25;
         /// OUT|VENDOR|DEVICE (airspy.c's host-to-device transfers).
         pub(crate) const VENDOR_OUT: u8 = 0x40;
         /// IN|VENDOR|DEVICE (airspy.c's device-to-host transfers).

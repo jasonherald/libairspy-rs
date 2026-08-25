@@ -638,16 +638,6 @@ mod tests {
         device.stop_rx().expect("stop");
         assert!(!device.is_streaming());
 
-        // Every bulk read used the C endpoint, buffer size, and
-        // timeout.
-        let bulk = transport.bulk_calls.lock().expect("mock lock").clone();
-        assert!(!bulk.is_empty());
-        for call in &bulk {
-            assert_eq!(call.endpoint, BULK_ENDPOINT);
-            assert_eq!(call.buf_len, BUFFER_SIZE);
-            assert_eq!(call.timeout, EVENT_TIMEOUT);
-        }
-
         let modes: Vec<(u8, u16)> = transport
             .take_recorded()
             .into_iter()
@@ -663,6 +653,38 @@ mod tests {
                 (wire::RECEIVER_MODE, wire::RECEIVER_MODE_OFF),
             ]
         );
+    }
+
+    #[test]
+    fn bulk_reads_use_c_parameters() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+
+        let transport = Arc::new(MockTransport::default());
+        transport.script_bulk(vec![BulkRead::Fill(0x11)]);
+        let mut device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+        device.start_rx(|_| true).expect("start_rx");
+        // Wait (bounded) for the reader's first bulk call so an
+        // instant stop can't win the race.
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        while transport.bulk_calls.lock().expect("mock lock").is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(core::time::Duration::from_millis(5));
+        }
+        device.stop_rx().expect("stop");
+
+        // Every bulk read used the C endpoint, buffer size, and
+        // timeout.
+        let bulk = transport.bulk_calls.lock().expect("mock lock").clone();
+        assert!(!bulk.is_empty());
+        for call in &bulk {
+            assert_eq!(call.endpoint, BULK_ENDPOINT);
+            assert_eq!(call.buf_len, BUFFER_SIZE);
+            assert_eq!(call.timeout, EVENT_TIMEOUT);
+        }
     }
 
     #[test]
