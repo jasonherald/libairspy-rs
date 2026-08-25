@@ -345,6 +345,12 @@ impl Device {
         self.sample_type
     }
 
+    /// The undoubled firmware rate table (the values
+    /// `airspy_set_samplerate` matches literal rates against).
+    pub(crate) fn raw_samplerates(&self) -> &[u32] {
+        &self.supported_samplerates
+    }
+
     /// Streaming worker accessors for `stream.rs`.
     pub(crate) fn stream_workers(&self) -> Option<&StreamWorkers> {
         self.workers.as_ref()
