@@ -8,6 +8,47 @@ use libairspy_rs::commands::SampleType;
 /// chunk + 8-byte data-chunk header, no padding.
 pub const WAV_HEADER_LEN: usize = 44;
 
+/// `wFormatTag` for integer PCM — the "1=PCM8/16" comment on
+/// `t_FormatChunk` in `airspy_rx.c`.
+pub const FORMAT_TAG_PCM: u16 = 1;
+/// `wFormatTag` for IEEE float — the "3=Float32" comment on
+/// `t_FormatChunk` in `airspy_rx.c`.
+pub const FORMAT_TAG_IEEE_FLOAT: u16 = 3;
+
+/// The fixed `chunkSize` of the format chunk ("16 fixed" in
+/// `t_FormatChunk`, set in the `wave_file_hdr` initializer).
+const FMT_CHUNK_SIZE: u32 = 16;
+/// The RIFF `size` field excludes the 8-byte chunk id + size pair —
+/// C's `file_pos - 8` in the header rewrite.
+const RIFF_SIZE_EXCLUDED: u32 = 8;
+
+// Byte offsets of the packed t_wav_file_hdr fields (t_WAVRIFF_hdr,
+// then t_FormatChunk, then t_DataChunk — airspy_rx.c):
+/// `t_WAVRIFF_hdr.size`.
+const RIFF_SIZE_OFFSET: usize = 4;
+/// `t_WAVRIFF_hdr.riffType`.
+const RIFF_TYPE_OFFSET: usize = 8;
+/// `t_FormatChunk.chunkID`.
+const FMT_ID_OFFSET: usize = 12;
+/// `t_FormatChunk.chunkSize`.
+const FMT_SIZE_OFFSET: usize = 16;
+/// `t_FormatChunk.wFormatTag`.
+const FORMAT_TAG_OFFSET: usize = 20;
+/// `t_FormatChunk.wChannels`.
+const CHANNELS_OFFSET: usize = 22;
+/// `t_FormatChunk.dwSamplesPerSec`.
+const SAMPLES_PER_SEC_OFFSET: usize = 24;
+/// `t_FormatChunk.dwAvgBytesPerSec`.
+const AVG_BYTES_PER_SEC_OFFSET: usize = 28;
+/// `t_FormatChunk.wBlockAlign`.
+const BLOCK_ALIGN_OFFSET: usize = 32;
+/// `t_FormatChunk.wBitsPerSample`.
+const BITS_PER_SAMPLE_OFFSET: usize = 34;
+/// `t_DataChunk.chunkID`.
+const DATA_ID_OFFSET: usize = 36;
+/// `t_DataChunk.chunkSize`.
+const DATA_SIZE_OFFSET: usize = 40;
+
 /// The most data bytes a classic RIFF/WAV file can carry: the 32-bit
 /// size fields cap the whole file at `u32::MAX` bytes, header
 /// included. C wraps its `uint32_t` `ftell` position past 4 GiB and
@@ -33,27 +74,27 @@ impl WavParams {
     pub fn for_sample_type(sample_type: SampleType) -> Self {
         match sample_type {
             SampleType::Float32Iq => Self {
-                format_tag: 3,
+                format_tag: FORMAT_TAG_IEEE_FLOAT,
                 channels: 2,
                 bits_per_sample: 32,
             },
             SampleType::Float32Real => Self {
-                format_tag: 3,
+                format_tag: FORMAT_TAG_IEEE_FLOAT,
                 channels: 1,
                 bits_per_sample: 32,
             },
             SampleType::Int16Iq => Self {
-                format_tag: 1,
+                format_tag: FORMAT_TAG_PCM,
                 channels: 2,
                 bits_per_sample: 16,
             },
             SampleType::Int16Real | SampleType::Uint16Real => Self {
-                format_tag: 1,
+                format_tag: FORMAT_TAG_PCM,
                 channels: 1,
                 bits_per_sample: 16,
             },
             SampleType::Raw => Self {
-                format_tag: 1,
+                format_tag: FORMAT_TAG_PCM,
                 channels: 1,
                 bits_per_sample: 12,
             },
@@ -76,11 +117,11 @@ impl WavParams {
 /// present, every "to update later" field zero.
 pub fn wav_header_placeholder() -> [u8; WAV_HEADER_LEN] {
     let mut bytes = [0u8; WAV_HEADER_LEN];
-    bytes[0..4].copy_from_slice(b"RIFF");
-    bytes[8..12].copy_from_slice(b"WAVE");
-    bytes[12..16].copy_from_slice(b"fmt ");
-    bytes[16..20].copy_from_slice(&16u32.to_le_bytes());
-    bytes[36..40].copy_from_slice(b"data");
+    bytes[0..RIFF_SIZE_OFFSET].copy_from_slice(b"RIFF");
+    bytes[RIFF_TYPE_OFFSET..FMT_ID_OFFSET].copy_from_slice(b"WAVE");
+    bytes[FMT_ID_OFFSET..FMT_SIZE_OFFSET].copy_from_slice(b"fmt ");
+    bytes[FMT_SIZE_OFFSET..FORMAT_TAG_OFFSET].copy_from_slice(&FMT_CHUNK_SIZE.to_le_bytes());
+    bytes[DATA_ID_OFFSET..DATA_SIZE_OFFSET].copy_from_slice(b"data");
     bytes
 }
 
@@ -98,18 +139,23 @@ pub fn wav_header_finalized(
     samples_per_sec: u32,
 ) -> [u8; WAV_HEADER_LEN] {
     let mut bytes = wav_header_placeholder();
-    bytes[4..8].copy_from_slice(&(file_pos.wrapping_sub(8)).to_le_bytes());
-    bytes[20..22].copy_from_slice(&params.format_tag.to_le_bytes());
-    bytes[22..24].copy_from_slice(&params.channels.to_le_bytes());
-    bytes[24..28].copy_from_slice(&samples_per_sec.to_le_bytes());
+    let riff_size = file_pos.wrapping_sub(RIFF_SIZE_EXCLUDED);
+    bytes[RIFF_SIZE_OFFSET..RIFF_TYPE_OFFSET].copy_from_slice(&riff_size.to_le_bytes());
+    bytes[FORMAT_TAG_OFFSET..CHANNELS_OFFSET].copy_from_slice(&params.format_tag.to_le_bytes());
+    bytes[CHANNELS_OFFSET..SAMPLES_PER_SEC_OFFSET].copy_from_slice(&params.channels.to_le_bytes());
+    bytes[SAMPLES_PER_SEC_OFFSET..AVG_BYTES_PER_SEC_OFFSET]
+        .copy_from_slice(&samples_per_sec.to_le_bytes());
     let avg_bytes_per_sec = samples_per_sec.wrapping_mul(u32::from(params.block_align()));
-    bytes[28..32].copy_from_slice(&avg_bytes_per_sec.to_le_bytes());
-    bytes[32..34].copy_from_slice(&params.block_align().to_le_bytes());
-    bytes[34..36].copy_from_slice(&params.bits_per_sample.to_le_bytes());
+    bytes[AVG_BYTES_PER_SEC_OFFSET..BLOCK_ALIGN_OFFSET]
+        .copy_from_slice(&avg_bytes_per_sec.to_le_bytes());
+    bytes[BLOCK_ALIGN_OFFSET..BITS_PER_SAMPLE_OFFSET]
+        .copy_from_slice(&params.block_align().to_le_bytes());
+    bytes[BITS_PER_SAMPLE_OFFSET..DATA_ID_OFFSET]
+        .copy_from_slice(&params.bits_per_sample.to_le_bytes());
     // WAV_HEADER_LEN is 44; the cast cannot truncate.
     #[allow(clippy::cast_possible_truncation)]
     let data_len = file_pos.wrapping_sub(WAV_HEADER_LEN as u32);
-    bytes[40..44].copy_from_slice(&data_len.to_le_bytes());
+    bytes[DATA_SIZE_OFFSET..WAV_HEADER_LEN].copy_from_slice(&data_len.to_le_bytes());
     bytes
 }
 
