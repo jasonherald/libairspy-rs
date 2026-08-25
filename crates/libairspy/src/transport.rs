@@ -109,6 +109,22 @@ pub(crate) mod mock {
         pub(crate) const BOARD_ID_READ: u8 = 9;
         /// `AIRSPY_GET_SAMPLERATES = 25` (`airspy_commands.h`).
         pub(crate) const GET_SAMPLERATES: u8 = 25;
+        /// `AIRSPY_SET_SAMPLERATE = 12` (`airspy_commands.h`).
+        pub(crate) const SET_SAMPLERATE: u8 = 12;
+        /// `AIRSPY_SET_LNA_GAIN = 14` (`airspy_commands.h`).
+        pub(crate) const SET_LNA_GAIN: u8 = 14;
+        /// `AIRSPY_SET_MIXER_GAIN = 15` (`airspy_commands.h`).
+        pub(crate) const SET_MIXER_GAIN: u8 = 15;
+        /// `AIRSPY_SET_VGA_GAIN = 16` (`airspy_commands.h`).
+        pub(crate) const SET_VGA_GAIN: u8 = 16;
+        /// `AIRSPY_SET_LNA_AGC = 17` (`airspy_commands.h`).
+        pub(crate) const SET_LNA_AGC: u8 = 17;
+        /// `AIRSPY_SET_MIXER_AGC = 18` (`airspy_commands.h`).
+        pub(crate) const SET_MIXER_AGC: u8 = 18;
+        /// `AIRSPY_GPIO_WRITE = 21` (`airspy_commands.h`).
+        pub(crate) const GPIO_WRITE: u8 = 21;
+        /// `AIRSPY_SET_PACKING = 26` (`airspy_commands.h`).
+        pub(crate) const SET_PACKING: u8 = 26;
         /// OUT|VENDOR|DEVICE (airspy.c's host-to-device transfers).
         pub(crate) const VENDOR_OUT: u8 = 0x40;
         /// IN|VENDOR|DEVICE (airspy.c's device-to-host transfers).
