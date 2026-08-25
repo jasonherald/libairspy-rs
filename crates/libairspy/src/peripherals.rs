@@ -209,6 +209,7 @@ mod tests {
             assert_eq!(c.request, req);
             assert_eq!((c.value, c.index), (0, reg));
             assert_eq!(c.data.len(), 1);
+            assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
         }
     }
 
@@ -236,6 +237,17 @@ mod tests {
         );
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 4);
+        // Writes are vendor-OUT, reads vendor-IN, all on the shared
+        // control timeout.
+        for (c, direction) in calls.iter().zip([
+            wire::VENDOR_OUT,
+            wire::VENDOR_IN,
+            wire::VENDOR_OUT,
+            wire::VENDOR_IN,
+        ]) {
+            assert_eq!(c.request_type, direction);
+            assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
+        }
         // port 2 << 5 | pin 7 = 71; port 0 << 5 | pin 31 = 31.
         assert_eq!(calls[0].request, wire::GPIO_WRITE);
         assert_eq!((calls[0].value, calls[0].index), (1, 71));
@@ -254,6 +266,10 @@ mod tests {
         device.spiflash_erase_sector(5).expect("sector");
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 2);
+        for c in &calls {
+            assert_eq!(c.request_type, wire::VENDOR_OUT);
+            assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
+        }
         assert_eq!(calls[0].request, wire::SPIFLASH_ERASE);
         assert_eq!((calls[0].value, calls[0].index), (0, 0));
         assert!(calls[0].data.is_empty());
@@ -268,7 +284,9 @@ mod tests {
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 1);
         let c = &calls[0];
+        assert_eq!(c.request_type, wire::VENDOR_OUT);
         assert_eq!(c.request, wire::SPIFLASH_WRITE);
+        assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
         // address >> 16 = 0x0A; address & 0xFFFF = 0xBCDE.
         assert_eq!((c.value, c.index), (0x0A, 0xBCDE));
         assert_eq!(c.data, vec![1, 2, 3]);
@@ -292,8 +310,41 @@ mod tests {
         let calls = transport.take_recorded();
         assert_eq!(calls.len(), 1);
         let c = &calls[0];
+        assert_eq!(c.request_type, wire::VENDOR_IN);
         assert_eq!(c.request, wire::SPIFLASH_READ);
+        assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
         assert_eq!((c.value, c.index), (0x01, 0x0002));
         assert_eq!(c.data.len(), 4);
+    }
+
+    #[test]
+    fn spiflash_length_boundary() {
+        let (transport, device) = mock_device();
+        // The largest length C's uint16_t parameter can express goes
+        // through unchanged for both directions...
+        let max_len = usize::from(u16::MAX);
+        device
+            .spiflash_write(0, &vec![0u8; max_len])
+            .expect("max write");
+        transport.script_reads(vec![Ok(vec![0xEE; max_len])]);
+        let mut buf = vec![0u8; max_len];
+        device.spiflash_read(0, &mut buf).expect("max read");
+        let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].data.len(), max_len);
+        assert_eq!(calls[1].data.len(), max_len);
+        // ...and one byte past it is unrepresentable on the wire:
+        // InvalidParam with nothing recorded (documented deviation —
+        // the C API cannot express this length at all).
+        assert!(matches!(
+            device.spiflash_write(0, &vec![0u8; max_len + 1]),
+            Err(crate::Error::InvalidParam)
+        ));
+        let mut over = vec![0u8; max_len + 1];
+        assert!(matches!(
+            device.spiflash_read(0, &mut over),
+            Err(crate::Error::InvalidParam)
+        ));
+        assert!(transport.take_recorded().is_empty());
     }
 }
