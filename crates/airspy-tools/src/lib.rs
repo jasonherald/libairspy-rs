@@ -5,6 +5,8 @@
 //! holds the argument-parsing and output-formatting code they share.
 #![warn(missing_docs)]
 
+pub mod rx;
+
 /// Failure to parse a `parse_u64`-style argument
 /// (C returns `AIRSPY_ERROR_INVALID_PARAM`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
