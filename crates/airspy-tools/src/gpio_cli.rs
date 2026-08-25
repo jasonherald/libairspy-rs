@@ -17,9 +17,10 @@ pub const PIN_NUM_MIN: u8 = 0;
 /// `PIN_NUM_MAX` in `airspy_gpio.c` / `airspy_gpiodir.c`.
 pub const PIN_NUM_MAX: u8 = 31;
 
-/// The ports in C iteration order (`GPIO_PORT0..GPIO_PORT7` in
-/// `dump_ports`); index = port number.
-pub const GPIO_PORTS: [GpioPort; 8] = [
+/// The ports in C iteration order (`GPIO_PORT0..GPIO_PORT7`, the
+/// `dump_ports` loop in `airspy_gpio.c` / `airspy_gpiodir.c`); index
+/// = port number, length = `PORT_NUM_MAX + 1`.
+pub const GPIO_PORTS: [GpioPort; PORT_NUM_MAX as usize + 1] = [
     GpioPort::Port0,
     GpioPort::Port1,
     GpioPort::Port2,
@@ -30,9 +31,10 @@ pub const GPIO_PORTS: [GpioPort; 8] = [
     GpioPort::Port7,
 ];
 
-/// The pins in C iteration order (`GPIO_PIN0..GPIO_PIN31` in
-/// `dump_port`); index = pin number.
-pub const GPIO_PINS: [GpioPin; 32] = [
+/// The pins in C iteration order (`GPIO_PIN0..GPIO_PIN31`, the
+/// `dump_port` loop in `airspy_gpio.c` / `airspy_gpiodir.c`); index =
+/// pin number, length = `PIN_NUM_MAX + 1`.
+pub const GPIO_PINS: [GpioPin; PIN_NUM_MAX as usize + 1] = [
     GpioPin::Pin0,
     GpioPin::Pin1,
     GpioPin::Pin2,
