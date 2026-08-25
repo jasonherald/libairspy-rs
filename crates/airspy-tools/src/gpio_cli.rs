@@ -338,13 +338,7 @@ pub fn gpio_command(name: &'static str, about: &'static str) -> clap::Command {
                 .action(clap::ArgAction::Append)
                 .help("write the selection set by the last -p/-n with value<v>[0,1]"),
         )
-        .arg(
-            clap::Arg::new("serial")
-                .short('s')
-                .value_name("serial_number_64bits")
-                .value_parser(crate::parse_u64)
-                .help("Open board with specified 64bits serial number"),
-        )
+        .arg(crate::serial_arg())
 }
 
 /// Recover the C getopt loop's op sequence: each occurrence of

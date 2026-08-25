@@ -235,11 +235,7 @@ pub fn ms_int_output_mhz(parms: u8, r_div: u32) -> f32 {
 /// `serial_long` mirrors the C difference: `airspy_si5351c.c` lists
 /// a `--serial` long option, `airspy_r820t.c` has only `-s`.
 pub fn reg_command(name: &'static str, about: &'static str, serial_long: bool) -> clap::Command {
-    let mut serial = clap::Arg::new("serial")
-        .short('s')
-        .value_name("serial_number_64bits")
-        .value_parser(crate::parse_u64)
-        .help("Open board with specified 64bits serial number");
+    let mut serial = crate::serial_arg();
     if serial_long {
         serial = serial.long("serial");
     }

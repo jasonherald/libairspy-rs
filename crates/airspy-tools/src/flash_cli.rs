@@ -179,11 +179,7 @@ fn range_args() -> Vec<clap::Arg> {
 /// `-s`, `--help`, and the `--force` confirmation deviation.
 fn control_args() -> Vec<clap::Arg> {
     vec![
-        clap::Arg::new("serial")
-            .short('s')
-            .value_name("serial_number_64bits")
-            .value_parser(crate::parse_u64)
-            .help("Open board with specified 64bits serial number"),
+        crate::serial_arg(),
         clap::Arg::new("help")
             .long("help")
             .action(clap::ArgAction::Help)

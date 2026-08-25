@@ -105,6 +105,17 @@ fn strtoull_whole(s: &str, base: u32) -> Option<u64> {
     })
 }
 
+/// The shared `-s serial_number_64bits` argument every tool's C
+/// getopt table carries; callers needing a long form (only
+/// `airspy_si5351c.c` lists `--serial`) add it.
+pub fn serial_arg() -> clap::Arg {
+    clap::Arg::new("serial")
+        .short('s')
+        .value_name("serial_number_64bits")
+        .value_parser(parse_u64)
+        .help("Open board with specified 64bits serial number")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
