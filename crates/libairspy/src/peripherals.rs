@@ -9,16 +9,29 @@
 use crate::commands::{Command, GpioPin, GpioPort};
 use crate::device::Device;
 use crate::error::{Error, Result};
-use crate::transfer::NO_WVALUE;
+use crate::transfer::{NO_WINDEX, NO_WVALUE};
 
 /// `airspy_spiflash_write`'s address bound: `address > 0x0FFFFF` is
 /// `AIRSPY_ERROR_INVALID_PARAM` (airspy.c).
 const SPIFLASH_MAX_ADDRESS: u32 = 0x000F_FFFF;
 
+/// Bits the port number occupies above the pin in the `port_pin`
+/// packing — the `((uint8_t)port) << 5` shift shared by every GPIO
+/// function in airspy.c.
+const GPIO_PORT_SHIFT: u8 = 5;
+
+/// Bits the low half of a SPI-flash address occupies in `wIndex` —
+/// the `address >> 16` / `address & 0xFFFF` split in
+/// `airspy_spiflash_write` and `airspy_spiflash_read` (airspy.c).
+const SPIFLASH_ADDR_LOW_BITS: u32 = 16;
+/// Mask selecting that low half (`address & 0xFFFF` in the same C
+/// functions).
+const SPIFLASH_ADDR_LOW_MASK: u32 = 0xFFFF;
+
 /// Pack `port << 5 | pin` (the `port_pin` computation shared by every
 /// GPIO function in airspy.c).
 fn port_pin(port: GpioPort, pin: GpioPin) -> u16 {
-    u16::from((port as u8) << 5 | pin as u8)
+    u16::from((port as u8) << GPIO_PORT_SHIFT | pin as u8)
 }
 
 impl Device {
@@ -95,7 +108,7 @@ impl Device {
     /// **Destructive**: this wipes the firmware image; only meaningful
     /// as part of a firmware-update flow with a new image ready.
     pub fn spiflash_erase(&self) -> Result<()> {
-        self.out_setter(Command::SpiflashErase, 0, 0, &[])
+        self.out_setter(Command::SpiflashErase, NO_WVALUE, NO_WINDEX, &[])
     }
 
     /// Erase one SPI-flash sector (`airspy_spiflash_erase_sector`).
@@ -104,7 +117,7 @@ impl Device {
     /// (0 and 1 are reserved) but the library does not validate, and
     /// neither does this port — the caller owns that judgment.
     pub fn spiflash_erase_sector(&self, sector: u16) -> Result<()> {
-        self.out_setter(Command::SpiflashEraseSector, sector, 0, &[])
+        self.out_setter(Command::SpiflashEraseSector, sector, NO_WINDEX, &[])
     }
 
     /// Write SPI flash (`airspy_spiflash_write`): the 20-bit address
@@ -125,8 +138,8 @@ impl Device {
         #[allow(clippy::cast_possible_truncation)]
         self.out_setter(
             Command::SpiflashWrite,
-            (address >> 16) as u16,
-            (address & 0xFFFF) as u16,
+            (address >> SPIFLASH_ADDR_LOW_BITS) as u16,
+            (address & SPIFLASH_ADDR_LOW_MASK) as u16,
             data,
         )
     }
@@ -141,8 +154,8 @@ impl Device {
         #[allow(clippy::cast_possible_truncation)]
         let n = self.vendor_in(
             Command::SpiflashRead,
-            (address >> 16) as u16,
-            (address & 0xFFFF) as u16,
+            (address >> SPIFLASH_ADDR_LOW_BITS) as u16,
+            (address & SPIFLASH_ADDR_LOW_MASK) as u16,
             buf,
         )?;
         if n < buf.len() {
@@ -167,6 +180,7 @@ mod tests {
         device.si5351c_write(0x10, 0xAB).expect("si");
         device.r820t_write(0x05, 0xCD).expect("r820t");
         let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 2);
         for (c, (req, val, reg)) in calls.iter().zip([
             (wire::SI5351C_WRITE, 0xAB, 0x10),
             (wire::R820T_WRITE, 0xCD, 0x05),
@@ -186,6 +200,7 @@ mod tests {
         assert_eq!(device.si5351c_read(0x11).expect("si"), 0x5A);
         assert_eq!(device.r820t_read(0x06).expect("r820t"), 0xA5);
         let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 2);
         for (c, (req, reg)) in calls
             .iter()
             .zip([(wire::SI5351C_READ, 0x11), (wire::R820T_READ, 0x06)])
