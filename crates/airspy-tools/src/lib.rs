@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 
 pub mod rx;
+pub mod rx_cli;
 
 /// Failure to parse a `parse_u64`-style argument
 /// (C returns `AIRSPY_ERROR_INVALID_PARAM`).
