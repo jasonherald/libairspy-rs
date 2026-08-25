@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 
 pub mod gpio_cli;
+pub mod reg_cli;
 pub mod rx;
 pub mod rx_cli;
 pub mod wav;
