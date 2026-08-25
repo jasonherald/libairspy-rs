@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use airspy_tools::rx::{
-    FD_BUFFER_SIZE, RateTracker, WAV_MAX_DATA_BYTES, extend_sample_bytes, frame_count,
-    resolve_display_rate, wav_header_finalized, wav_header_placeholder,
+    FD_BUFFER_SIZE, RateTracker, WAV_MAX_DATA_BYTES, apply_byte_budget, extend_sample_bytes,
+    frame_count, resolve_display_rate, wav_header_finalized, wav_header_placeholder,
 };
 use airspy_tools::rx_cli::{Args, Config, build_config, print_verbose, usage};
 use clap::Parser;
@@ -76,14 +76,7 @@ fn on_transfer(
 
     state.buf.clear();
     extend_sample_bytes(&mut state.buf, &transfer.samples);
-    let mut bytes_to_write = state.buf.len();
-    if let Some(remaining) = state.remaining.as_mut() {
-        #[allow(clippy::cast_possible_truncation)]
-        if bytes_to_write as u64 >= *remaining {
-            bytes_to_write = *remaining as usize;
-        }
-        *remaining -= bytes_to_write as u64;
-    }
+    let bytes_to_write = apply_byte_budget(&mut state.remaining, state.buf.len());
 
     let Some(writer) = state.writer.as_mut() else {
         return false;

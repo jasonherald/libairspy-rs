@@ -336,6 +336,25 @@ impl RateTracker {
     }
 }
 
+/// The `-n` limiting from `rx_callback` in `airspy_rx.c`: clamp the
+/// block to the remaining budget and deduct what will be written.
+/// Returns the byte count to write; `None` means unlimited.
+#[allow(clippy::cast_possible_truncation)]
+pub fn apply_byte_budget(remaining: &mut Option<u64>, block_len: usize) -> usize {
+    let Some(remaining) = remaining.as_mut() else {
+        return block_len;
+    };
+    // C: if (bytes_to_write >= bytes_to_xfer) bytes_to_write =
+    // bytes_to_xfer; bytes_to_xfer -= bytes_to_write;
+    let bytes_to_write = if block_len as u64 >= *remaining {
+        *remaining as usize
+    } else {
+        block_len
+    };
+    *remaining -= bytes_to_write as u64;
+    bytes_to_write
+}
+
 /// C's `transfer->sample_count` for a delivered block: frames (IQ
 /// pairs count once) for the converted types, and for RAW the sample
 /// count behind the wire bytes — `len * 2 / 3` packed 12-bit,
@@ -613,6 +632,25 @@ mod tests {
         assert_eq!(tracker.rate_samples, 1);
         assert!((tracker.average_rate - 10_000.0).abs() < 1.0);
         assert!((tracker.global_average_rate - 10_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn apply_byte_budget_clamps_and_deducts_like_c() {
+        // No -n: everything is written, nothing tracked.
+        let mut unlimited = None;
+        assert_eq!(apply_byte_budget(&mut unlimited, 4096), 4096);
+        assert_eq!(unlimited, None);
+        // Budget larger than the block: full write, deducted.
+        let mut remaining = Some(10_000u64);
+        assert_eq!(apply_byte_budget(&mut remaining, 4096), 4096);
+        assert_eq!(remaining, Some(5904));
+        // Budget smaller than the block: clamp, then exhausted.
+        let mut remaining = Some(100u64);
+        assert_eq!(apply_byte_budget(&mut remaining, 4096), 100);
+        assert_eq!(remaining, Some(0));
+        // Exhausted budget writes nothing.
+        assert_eq!(apply_byte_budget(&mut remaining, 4096), 0);
+        assert_eq!(remaining, Some(0));
     }
 
     #[test]
