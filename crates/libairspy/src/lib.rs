@@ -30,6 +30,7 @@ pub mod stream_tokio;
 #[cfg(test)]
 pub(crate) mod test_vectors;
 mod transfer;
+mod transport;
 
 pub use board::PartIdSerial;
 pub use conversion::Samples;
