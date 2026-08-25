@@ -93,42 +93,12 @@ pub fn replay_reg_ops(
     let mut outcome = ReplayOutcome::NoOps;
     for op in ops {
         let ok = match op {
-            RegOp::Register(raw) => {
-                if let Some(value) = parse_u8(raw).filter(|v| *v <= spec.register_max) {
-                    // C's case 'n' stores the parse result, so a
-                    // bare -n suppresses usage().
-                    register = Some(value);
-                    outcome = ReplayOutcome::Completed;
-                    true
-                } else {
-                    if spec.print_messages {
-                        out(format!(
-                            "Error parameter -n shall be between 0 and {}",
-                            spec.register_max
-                        ));
-                    }
-                    false
-                }
-            }
+            RegOp::Register(raw) => latch_register(spec, raw, &mut register, &mut outcome, out),
             RegOp::Read => {
                 let scope = register.map_or(RegReadScope::All, RegReadScope::Single);
                 run_operation(&read(scope), &mut outcome)
             }
-            RegOp::Write(raw) => match (parse_u8(raw), register) {
-                (Some(value), Some(register)) => {
-                    run_operation(&write(register, value), &mut outcome)
-                }
-                (None, _) => {
-                    if spec.print_messages {
-                        out("Error parameter -w shall be between 0 and 255".into());
-                    }
-                    false
-                }
-                _ => {
-                    out("error: -w requires -n".into());
-                    false
-                }
-            },
+            RegOp::Write(raw) => write_latched(spec, raw, register, &mut outcome, write, out),
             RegOp::Config => run_operation(&config(), &mut outcome),
         };
         if !ok {
@@ -136,6 +106,60 @@ pub fn replay_reg_ops(
         }
     }
     outcome
+}
+
+/// The shared body of C's `case 'n'`: parse, range-check per the
+/// spec, latch on success — and store the parse result in the
+/// outcome, so a bare `-n` suppresses `usage()` just as C's `result`
+/// variable does. The r820t spec prints C's range message; the
+/// si5351c spec fails silently.
+fn latch_register(
+    spec: RegToolSpec,
+    raw: &str,
+    register: &mut Option<u8>,
+    outcome: &mut ReplayOutcome,
+    out: &mut impl FnMut(String),
+) -> bool {
+    if let Some(value) = parse_u8(raw).filter(|v| *v <= spec.register_max) {
+        *register = Some(value);
+        *outcome = ReplayOutcome::Completed;
+        true
+    } else {
+        if spec.print_messages {
+            out(format!(
+                "Error parameter -n shall be between 0 and {}",
+                spec.register_max
+            ));
+        }
+        false
+    }
+}
+
+/// The shared body of C's `case 'w'`: parse the value (r820t prints
+/// C's 0..255 message on failure, si5351c is silent) and write to
+/// the latched register — requiring one (deviation: C writes its
+/// default/sentinel register on the wire).
+fn write_latched(
+    spec: RegToolSpec,
+    raw: &str,
+    register: Option<u8>,
+    outcome: &mut ReplayOutcome,
+    write: &mut impl FnMut(u8, u8) -> Result<(), Error>,
+    out: &mut impl FnMut(String),
+) -> bool {
+    match (parse_u8(raw), register) {
+        (Some(value), Some(register)) => run_operation(&write(register, value), outcome),
+        (None, _) => {
+            if spec.print_messages {
+                out("Error parameter -w shall be between 0 and 255".into());
+            }
+            false
+        }
+        _ => {
+            out("error: -w requires -n".into());
+            false
+        }
+    }
 }
 
 /// The success/failure tail shared by the operation arms: mark
@@ -152,6 +176,13 @@ fn run_operation(result: &Result<(), Error>, outcome: &mut ReplayOutcome) -> boo
 /// `div_lut` in `dump_multisynth_config` (`airspy_si5351c.c`) — the
 /// output-divider power-of-two table.
 pub const DIV_LUT: [u32; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+
+/// The `(double)800` PLL frequency literal in the MS0–MS5 output
+/// formula (`dump_multisynth_config`, `airspy_si5351c.c`).
+const PLL_FREQ_MHZ: f64 = 800.0;
+/// The `800.0f` literal in the MS6/MS7 float formula — C keeps this
+/// path in single precision, so the constant stays f32.
+const PLL_FREQ_MHZ_F32: f32 = 800.0;
 
 /// The decoded multisynth parameters from `dump_multisynth_config`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,14 +220,14 @@ pub fn ms_output_mhz(params: &MsParams) -> f64 {
         + f64::from(params.p2)
         + f64::from(512 * params.p3))
         / f64::from(128 * params.p3);
-    (800.0 / divider) / f64::from(DIV_LUT[params.r_div as usize])
+    (PLL_FREQ_MHZ / divider) / f64::from(DIV_LUT[params.r_div as usize])
 }
 
 /// The MS6/MS7 integer output print: `(800.0f / parms) /
 /// div_lut[r_div]` — float math in C, kept in f32.
 #[allow(clippy::cast_precision_loss)]
 pub fn ms_int_output_mhz(parms: u8, r_div: u32) -> f32 {
-    (800.0f32 / f32::from(parms)) / DIV_LUT[r_div as usize] as f32
+    (PLL_FREQ_MHZ_F32 / f32::from(parms)) / DIV_LUT[r_div as usize] as f32
 }
 
 /// The shared clap command for both register tools — the C
@@ -336,6 +367,25 @@ mod tests {
             reg_command("t", "t", true)
                 .try_get_matches_from(["t", "--serial", "0x1"])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn repeated_flag_occurrences_keep_their_indices() {
+        // -r and -c are zero-value appends so every occurrence keeps
+        // its own clap index; interleavings replay in order.
+        let matches = reg_command("t", "t", true)
+            .try_get_matches_from(["t", "-r", "-c", "-n", "5", "-r", "-c"])
+            .expect("parse");
+        assert_eq!(
+            reg_ops_from_matches(&matches),
+            [
+                RegOp::Read,
+                RegOp::Config,
+                RegOp::Register("5".into()),
+                RegOp::Read,
+                RegOp::Config,
+            ]
         );
     }
 
