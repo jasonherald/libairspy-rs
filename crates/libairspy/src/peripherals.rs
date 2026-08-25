@@ -235,6 +235,7 @@ mod tests {
             0
         );
         let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 4);
         // port 2 << 5 | pin 7 = 71; port 0 << 5 | pin 31 = 31.
         assert_eq!(calls[0].request, wire::GPIO_WRITE);
         assert_eq!((calls[0].value, calls[0].index), (1, 71));
@@ -252,6 +253,7 @@ mod tests {
         device.spiflash_erase().expect("erase");
         device.spiflash_erase_sector(5).expect("sector");
         let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].request, wire::SPIFLASH_ERASE);
         assert_eq!((calls[0].value, calls[0].index), (0, 0));
         assert!(calls[0].data.is_empty());
@@ -264,17 +266,20 @@ mod tests {
         let (transport, device) = mock_device();
         device.spiflash_write(0x0A_BCDE, &[1, 2, 3]).expect("write");
         let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 1);
         let c = &calls[0];
         assert_eq!(c.request, wire::SPIFLASH_WRITE);
         // address >> 16 = 0x0A; address & 0xFFFF = 0xBCDE.
         assert_eq!((c.value, c.index), (0x0A, 0xBCDE));
         assert_eq!(c.data, vec![1, 2, 3]);
 
-        // C: address > 0x0FFFFF → AIRSPY_ERROR_INVALID_PARAM.
+        // C: address > 0x0FFFFF → AIRSPY_ERROR_INVALID_PARAM, checked
+        // before any transfer — nothing may reach the wire.
         assert!(matches!(
             device.spiflash_write(0x10_0000, &[0]),
             Err(crate::Error::InvalidParam)
         ));
+        assert!(transport.take_recorded().is_empty());
     }
 
     #[test]
@@ -284,7 +289,9 @@ mod tests {
         let mut buf = [0u8; 4];
         device.spiflash_read(0x01_0002, &mut buf).expect("read");
         assert_eq!(buf, [9, 8, 7, 6]);
-        let c = &transport.take_recorded()[0];
+        let calls = transport.take_recorded();
+        assert_eq!(calls.len(), 1);
+        let c = &calls[0];
         assert_eq!(c.request, wire::SPIFLASH_READ);
         assert_eq!((c.value, c.index), (0x01, 0x0002));
         assert_eq!(c.data.len(), 4);
