@@ -79,6 +79,7 @@ fn write_calibration(device: &Device, correction_ppb: i32) -> Result<(), ()> {
 }
 
 fn main() {
+    airspy_tools::reset_sigpipe();
     let matches = calib_command().get_matches();
     let read = matches.get_flag("read");
     let write = matches.get_one::<i32>("write").copied();

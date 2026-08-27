@@ -10,6 +10,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "libairspy-rs",
+ "libc",
 ]
 
 [[package]]

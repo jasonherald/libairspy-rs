@@ -31,6 +31,7 @@ fn print_error(context: &str, err: &Error) {
 }
 
 fn main() {
+    airspy_tools::reset_sigpipe();
     let args = Args::parse();
 
     if let Some(serial) = args.serial_number {

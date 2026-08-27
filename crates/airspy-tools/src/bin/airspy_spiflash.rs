@@ -169,6 +169,7 @@ fn load_write_file(path: &str, address: u32) -> (Vec<u8>, u32) {
 }
 
 fn main() {
+    airspy_tools::reset_sigpipe();
     let matches = flash_command().get_matches();
     let address = matches.get_one::<u32>("address").copied().unwrap_or(0);
     let mut length = matches.get_one::<u32>("length").copied().unwrap_or(0);

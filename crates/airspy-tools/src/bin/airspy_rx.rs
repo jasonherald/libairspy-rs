@@ -93,6 +93,7 @@ fn on_transfer(
 }
 
 fn main() {
+    airspy_tools::reset_sigpipe();
     let args = Args::parse();
     let date_time = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let config = match build_config(&args, &date_time) {
@@ -402,6 +403,15 @@ fn run(config: &Config) -> i32 {
     eprintln!("Stop with Ctrl-C");
     std::thread::sleep(LOOP_SLEEP);
     stream_loop(&device, &shared);
+    // C's is_streaming stays true after the callback stops the
+    // stream, so its loop always leaves via the budget branch and a
+    // completed -n capture prints "User cancel, exiting...". Our
+    // flag reflects the real stream state, so mirror C's message
+    // path explicitly when the byte budget drove the stop
+    // (hardware-verified against the C tool).
+    if lock_shared(&shared).remaining == Some(0) {
+        DO_EXIT.store(true, Ordering::SeqCst);
+    }
     print_summary(config, &shared, started);
 
     if let Err(err) = device.stop_rx() {

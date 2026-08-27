@@ -128,6 +128,7 @@ fn dump_configuration(device: &Device) -> Result<(), Error> {
 }
 
 fn main() {
+    airspy_tools::reset_sigpipe();
     let matches = reg_command(
         "airspy_si5351c",
         "Read and write the Airspy si5351c clock generator registers",

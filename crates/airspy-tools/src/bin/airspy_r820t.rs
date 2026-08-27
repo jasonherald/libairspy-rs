@@ -91,6 +91,7 @@ fn configure_registers(device: &Device) -> Result<(), Error> {
 }
 
 fn main() {
+    airspy_tools::reset_sigpipe();
     let matches = reg_command(
         "airspy_r820t",
         "Read and write the Airspy R820T tuner registers",
