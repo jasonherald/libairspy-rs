@@ -80,6 +80,7 @@ fn write_port_pin(device: &Device, port: GpioPort, pin: GpioPin, value: u8) -> R
 }
 
 fn main() {
+    airspy_tools::reset_sigpipe();
     let matches = gpio_command(
         "airspy_gpiodir",
         "Read and write Airspy GPIO pin directions",

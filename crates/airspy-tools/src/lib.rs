@@ -108,6 +108,22 @@ fn strtoull_whole(s: &str, base: u32) -> Option<u64> {
     })
 }
 
+/// Restore SIGPIPE's default disposition so a closed pipe kills the
+/// process silently (exit 141), exactly as the C tools die — Rust
+/// ignores SIGPIPE by default, which turned `airspy_si5351c -r |
+/// head` into a "failed printing to stdout: Broken pipe" panic.
+/// Call first in every binary's `main`.
+pub fn reset_sigpipe() {
+    // SAFETY: signal(SIGPIPE, SIG_DFL) only restores the process
+    // default disposition; it takes no user handler and runs before
+    // any other thread exists (first statement of main).
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 /// The shared `-s serial_number_64bits` argument every tool's C
 /// getopt table carries; callers needing a long form (only
 /// `airspy_si5351c.c` lists `--serial`) add it.
