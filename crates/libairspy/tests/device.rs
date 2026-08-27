@@ -211,11 +211,21 @@ mod tests {
             device = returned;
             assert_eq!(blocks.len(), SHORT_STREAM_BLOCKS, "{sample_type:?}");
             for block in &blocks {
-                let (len, finite) = match block {
-                    SampleBlock::Float32(s) => (s.len(), s.iter().all(|v| v.is_finite())),
-                    SampleBlock::Int16(s) => (s.len(), true),
-                    SampleBlock::Uint16(s) => (s.len(), true),
-                    SampleBlock::Raw(s) => (s.len(), true),
+                // Each sample type must arrive in its own block
+                // variant — the conversion dispatch, not just the
+                // latched metadata.
+                let (len, finite) = match (sample_type, block) {
+                    (SampleType::Float32Iq | SampleType::Float32Real, SampleBlock::Float32(s)) => {
+                        (s.len(), s.iter().all(|v| v.is_finite()))
+                    }
+                    (SampleType::Int16Iq | SampleType::Int16Real, SampleBlock::Int16(s)) => {
+                        (s.len(), true)
+                    }
+                    (SampleType::Uint16Real, SampleBlock::Uint16(s)) => (s.len(), true),
+                    (SampleType::Raw, SampleBlock::Raw(s)) => (s.len(), true),
+                    (_, other) => {
+                        unreachable!("{sample_type:?} delivered the wrong variant: {other:?}")
+                    }
                 };
                 assert!(len > 0, "{sample_type:?}: empty block");
                 assert!(finite, "{sample_type:?}: non-finite samples");
