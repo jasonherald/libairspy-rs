@@ -108,11 +108,12 @@ fn strtoull_whole(s: &str, base: u32) -> Option<u64> {
     })
 }
 
-/// Restore SIGPIPE's default disposition so a closed pipe kills the
-/// process silently (exit 141), exactly as the C tools die — Rust
-/// ignores SIGPIPE by default, which turned `airspy_si5351c -r |
-/// head` into a "failed printing to stdout: Broken pipe" panic.
-/// Call first in every binary's `main`.
+/// On Unix, restore SIGPIPE's default disposition so a closed pipe
+/// kills the process silently (exit 141), exactly as the C tools
+/// die — Rust ignores SIGPIPE by default, which turned
+/// `airspy_si5351c -r | head` into a "failed printing to stdout:
+/// Broken pipe" panic. On non-Unix targets (no SIGPIPE semantics)
+/// this is a no-op. Call first in every binary's `main`.
 pub fn reset_sigpipe() {
     // SAFETY: signal(SIGPIPE, SIG_DFL) only restores the process
     // default disposition; it takes no user handler and runs before
