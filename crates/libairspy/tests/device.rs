@@ -203,6 +203,7 @@ mod tests {
         // below ADC_WORD_LIMIT, top nibbles all zero.
         device.set_packing(false).expect("packing off");
         let unpacked = capture_blocks(&mut device, SampleType::Raw, SHORT_STREAM_BLOCKS);
+        assert_eq!(unpacked.len(), SHORT_STREAM_BLOCKS);
         for block in &unpacked {
             let SampleBlock::Raw(bytes) = block else {
                 unreachable!("expected raw block, got {block:?}");
@@ -220,6 +221,7 @@ mod tests {
         // the wire (block byte counts are identical in both modes).
         device.set_packing(true).expect("packing on");
         let packed = capture_blocks(&mut device, SampleType::Raw, SHORT_STREAM_BLOCKS);
+        assert_eq!(packed.len(), SHORT_STREAM_BLOCKS);
         for block in &packed {
             let SampleBlock::Raw(bytes) = block else {
                 unreachable!("expected raw block, got {block:?}");
