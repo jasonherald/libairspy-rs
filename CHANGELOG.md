@@ -19,7 +19,9 @@ libraries and tools, validated against an Airspy R2.
 - **`libairspy-rs` library** (license `BSD-3-Clause AND MIT`), a
   faithful wire-compatible port of `libairspy`:
   - Device enumeration, open (plain and by 64-bit serial), and the
-    full `airspy.h` control surface: frequency, sample rate
+    `airspy.h` control surface (complete except the
+    header-only `airspy_config_read`/`write` — see Changed):
+    frequency, sample rate
     (index-or-Hz), individual LNA/mixer/VGA gains, linearity and
     sensitivity composite gain tables, AGCs, bias tee, 12-bit sample
     packing, receiver mode.
