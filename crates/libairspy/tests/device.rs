@@ -65,12 +65,28 @@ fn with_stall_guard<T: Send + 'static>(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut device = device;
-        let result = capture(&mut device);
+        // A panicking capture must surface as itself, not as a
+        // 30-second "stalled" timeout: catch it and re-raise on the
+        // test thread immediately.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture(&mut device)));
         // A dropped receiver (timed-out test) makes this send a no-op.
-        let _ = tx.send((device, result));
+        let _ = tx.send(result.map(|value| (device, value)));
     });
-    rx.recv_timeout(STALL_TIMEOUT)
-        .expect("device stalled: capture did not finish within STALL_TIMEOUT")
+    // On a true stall the worker stays blocked in the USB read and
+    // keeps the exclusive handle — nothing outside the kernel can
+    // cancel that read, so the honest behavior is a prompt, explicit
+    // failure. Later opens in the same run may then fail too; with
+    // hardware that wedged, replug the Airspy before rerunning.
+    let outcome = rx.recv_timeout(STALL_TIMEOUT).expect(
+        "device stalled: capture did not finish within STALL_TIMEOUT \
+         (the worker thread still holds the USB handle; replug the \
+         Airspy before rerunning)",
+    );
+    match outcome {
+        Ok(pair) => pair,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Pull a handful of transfers in the device's current configuration,
