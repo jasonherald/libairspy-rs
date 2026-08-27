@@ -48,17 +48,19 @@ libraries and tools, validated against an Airspy R2.
   MSRV 1.95, cross-platform, CodeQL, cargo-audit, cargo-deny,
   coverage), licensing and upstream attribution.
 
-### Changed (deviations from the C implementation, each documented at
-its code site)
+### Changed
 
-- Upstream bugs are fixed rather than propagated: converter
-  out-of-bounds accesses (packed-tail unpack, `translate_fs_4`),
-  half-uninitialized int16 converter reset, `airspy_rx`'s `-b`
-  serial-number copy-paste bug, WAV `dwAvgBytesPerSec` missing the
-  channel factor, WAV size-field wrap past 4 GiB (captures stop at
-  the RIFF limit), flash bounds checks that ignored the address,
-  `strtoul`/`atoi` silent truncations on values bound for hardware,
-  and register writes to C's unset-selection sentinel registers.
+Deviations from the C implementation, each documented at its code
+site. Upstream bugs are fixed rather than propagated:
+
+- Converter out-of-bounds accesses (packed-tail unpack,
+  `translate_fs_4`) and the half-uninitialized int16 converter reset.
+- `airspy_rx`'s `-b` serial-number copy-paste bug.
+- WAV `dwAvgBytesPerSec` missing the channel factor, and the WAV
+  size-field wrap past 4 GiB (captures stop at the RIFF limit).
+- Flash bounds checks that ignored the address.
+- `strtoul`/`atoi` silent truncations on values bound for hardware.
+- Register writes to C's unset-selection sentinel registers.
 - Destructive tool operations (`airspy_gpiodir -w`, `airspy_spiflash
   -w`, `airspy_calibrate -w`) require an explicit `--force`.
 - Failed tool operations exit nonzero (C exits 0).
