@@ -28,41 +28,73 @@ const TEST_FREQ_HZ: u32 = 100_000_000;
 /// several USB transfers without dragging the suite out.
 const SHORT_STREAM_BLOCKS: usize = 5;
 
-/// `airspy_set_lna_gain`'s clamp bound (14) in `airspy.c`.
+/// `airspy_set_lna_gain`'s clamp bound (`value > 14` in
+/// `airspyone_host` `libairspy/src/airspy.c`).
 const LNA_GAIN_MAX: u8 = 14;
-/// `airspy_set_mixer_gain` / `airspy_set_vga_gain` clamp bound (15).
+/// `airspy_set_mixer_gain`'s clamp bound (`value > 15` in
+/// `airspy.c`).
 const MIXER_GAIN_MAX: u8 = 15;
-/// See [`MIXER_GAIN_MAX`].
+/// `airspy_set_vga_gain`'s clamp bound (`value > 15` in `airspy.c`).
 const VGA_GAIN_MAX: u8 = 15;
-/// The 22-entry linearity/sensitivity tables in `airspy.c` accept
-/// indices 0..=21.
+/// The last index of `airspy.c`'s 22-entry
+/// `airspy_linearity_*_gains` / `airspy_sensitivity_*_gains` tables.
 const COMPOSITE_GAIN_MAX: u8 = 21;
 
-/// A 12-bit ADC word: unpacked RAW words carry values below this,
-/// leaving the top nibble of every 16-bit word zero; the packed
+/// One past the largest 12-bit ADC value — the sample width of
+/// `airspy.c`'s `unpack_samples` bitstream. Unpacked RAW words stay
+/// below this (top nibble of every 16-bit word zero); the packed
 /// 12-bit stream uses every nibble.
 const ADC_WORD_LIMIT: u16 = 1 << 12;
+
+/// How long a capture may run before the suite declares the device
+/// stalled. The library's reader tolerates bulk timeouts exactly as
+/// C's event loop does, so a silent device would otherwise block a
+/// blocking iterator read forever.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run a device-borrowing capture on a worker thread, failing the
+/// test if it does not finish within [`STALL_TIMEOUT`] — a silent
+/// device keeps the reader polling (C event-loop semantics), which
+/// would otherwise hang a blocking iterator read forever. The device
+/// moves through the worker and back so a timed-out capture cannot
+/// race a reopened handle.
+fn with_stall_guard<T: Send + 'static>(
+    device: Device,
+    capture: impl FnOnce(&mut Device) -> T + Send + 'static,
+) -> (Device, T) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut device = device;
+        let result = capture(&mut device);
+        // A dropped receiver (timed-out test) makes this send a no-op.
+        let _ = tx.send((device, result));
+    });
+    rx.recv_timeout(STALL_TIMEOUT)
+        .expect("device stalled: capture did not finish within STALL_TIMEOUT")
+}
 
 /// Pull a handful of transfers in the device's current configuration,
 /// asserting each reports the expected latched sample type.
 fn capture_blocks(
-    device: &mut Device,
+    device: Device,
     expected_type: SampleType,
     count: usize,
-) -> Vec<SampleBlock> {
-    let mut blocks = Vec::new();
-    {
-        let iter = device.rx_blocks().expect("rx_blocks");
-        for transfer in iter.take(count) {
-            assert_eq!(
-                transfer.sample_type, expected_type,
-                "transfer reports the wrong sample type"
-            );
-            blocks.push(transfer.samples);
+) -> (Device, Vec<SampleBlock>) {
+    with_stall_guard(device, move |device| {
+        let mut blocks = Vec::new();
+        {
+            let iter = device.rx_blocks().expect("rx_blocks");
+            for transfer in iter.take(count) {
+                assert_eq!(
+                    transfer.sample_type, expected_type,
+                    "transfer reports the wrong sample type"
+                );
+                blocks.push(transfer.samples);
+            }
         }
-    }
-    assert!(!device.is_streaming(), "stream still live after drop");
-    blocks
+        assert!(!device.is_streaming(), "stream still live after drop");
+        blocks
+    })
 }
 
 /// Fraction of 16-bit words in a RAW block whose top nibble is used.
@@ -175,7 +207,8 @@ mod tests {
             SampleType::Raw,
         ] {
             device.set_sample_type(sample_type).expect("set type");
-            let blocks = capture_blocks(&mut device, sample_type, SHORT_STREAM_BLOCKS);
+            let (returned, blocks) = capture_blocks(device, sample_type, SHORT_STREAM_BLOCKS);
+            device = returned;
             assert_eq!(blocks.len(), SHORT_STREAM_BLOCKS, "{sample_type:?}");
             for block in &blocks {
                 let (len, finite) = match block {
@@ -202,7 +235,8 @@ mod tests {
         // Unpacked RAW: 12-bit ADC values in 16-bit words — every word
         // below ADC_WORD_LIMIT, top nibbles all zero.
         device.set_packing(false).expect("packing off");
-        let unpacked = capture_blocks(&mut device, SampleType::Raw, SHORT_STREAM_BLOCKS);
+        let (returned, unpacked) = capture_blocks(device, SampleType::Raw, SHORT_STREAM_BLOCKS);
+        device = returned;
         assert_eq!(unpacked.len(), SHORT_STREAM_BLOCKS);
         for block in &unpacked {
             let SampleBlock::Raw(bytes) = block else {
@@ -220,7 +254,8 @@ mod tests {
         // limit — this is what proves set_packing(true) took effect on
         // the wire (block byte counts are identical in both modes).
         device.set_packing(true).expect("packing on");
-        let packed = capture_blocks(&mut device, SampleType::Raw, SHORT_STREAM_BLOCKS);
+        let (returned, packed) = capture_blocks(device, SampleType::Raw, SHORT_STREAM_BLOCKS);
+        device = returned;
         assert_eq!(packed.len(), SHORT_STREAM_BLOCKS);
         for block in &packed {
             let SampleBlock::Raw(bytes) = block else {
@@ -250,10 +285,10 @@ mod tests {
         let rates = device.samplerates();
         let nominal = rates.first().copied().expect("a rate");
 
-        let mut dropped = 0u64;
-        let mut frames = 0u64;
         let started = Instant::now();
-        {
+        let (device, (dropped, frames)) = with_stall_guard(device, move |device| {
+            let mut dropped = 0u64;
+            let mut frames = 0u64;
             let iter = device.rx_blocks().expect("rx_blocks");
             for transfer in iter {
                 dropped += transfer.dropped_samples;
@@ -264,7 +299,9 @@ mod tests {
                     break;
                 }
             }
-        }
+            (dropped, frames)
+        });
+        drop(device);
         let elapsed = started.elapsed().as_secs_f64();
         // Frame counts over a few seconds sit far below 2^52.
         #[allow(clippy::cast_precision_loss)]
@@ -290,7 +327,8 @@ mod tests {
         device.set_freq(TEST_FREQ_HZ).expect("freq");
         device.set_sample_type(SampleType::Float32Iq).expect("type");
         for round in 0..3 {
-            let blocks = capture_blocks(&mut device, SampleType::Float32Iq, 2);
+            let (returned, blocks) = capture_blocks(device, SampleType::Float32Iq, 2);
+            device = returned;
             assert_eq!(blocks.len(), 2, "round {round}");
         }
     }
