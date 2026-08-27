@@ -11,8 +11,9 @@ by crates.io publishes of `libairspy-rs`.
 
 ## [0.1.0] - 2026-08-27
 
-First release: a complete pure-Rust port of the `airspyone_host` C
-libraries and tools, validated against an Airspy R2.
+First release: a pure-Rust port of all implemented `airspyone_host`
+functionality — library and all eight tools — validated against an
+Airspy R2.
 
 ### Added
 
