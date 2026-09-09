@@ -20,7 +20,7 @@ exclude = [
 ]
 
 [dependencies]
-rusb.workspace = true
+nusb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

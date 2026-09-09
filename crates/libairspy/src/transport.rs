@@ -1,16 +1,44 @@
 //! The USB transport seam: every wire operation the driver performs
-//! goes through [`UsbTransport`], implemented by
-//! `rusb::DeviceHandle<rusb::Context>` in production and by
+//! goes through [`UsbTransport`], implemented by [`NusbTransport`]
+//! (wrapping a claimed `nusb::Interface`) in production and by
 //! [`mock::MockTransport`] in tests — giving the control surface and
 //! streaming engine transport-boundary tests without hardware.
+//!
+//! ## Streaming model
+//!
+//! Unlike the previous rusb backend — which exposed only synchronous
+//! bulk reads and so kept a single transfer in flight — nusb's
+//! [`Endpoint`](nusb::Endpoint) lets the reader keep
+//! [`TRANSFER_COUNT`](crate::stream::TRANSFER_COUNT) bulk transfers
+//! queued at once, exactly like `airspy.c`'s `transfer_count = 16`
+//! asynchronous URB pool. The whole streaming loop therefore lives
+//! behind the transport, in [`UsbTransport::run_bulk_stream`], so the
+//! reader thread in `stream.rs` just calls it and the mock can drive a
+//! scripted sequence through the same seam.
 
-use std::time::Duration;
+use core::time::Duration;
+use std::sync::atomic::Ordering;
 
-/// The USB operations `airspy.c` performs against an open device
-/// handle. Method shapes mirror rusb's so the production impl is pure
-/// delegation.
+use nusb::MaybeFuture as _;
+use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient, TransferError};
+
+use crate::error::Result;
+use crate::stream::{BUFFER_SIZE, EVENT_TIMEOUT, StreamShared, TRANSFER_COUNT};
+
+/// `LIBUSB_CTRL_TIMEOUT_MS` (500) — the timeout `airspy.c` uses for the
+/// bare `libusb_clear_halt` control transfer.
+const CLEAR_HALT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The USB operations `airspy.c` performs against an open device.
+///
+/// The control methods return the driver [`Result`] directly (the nusb
+/// error types are mapped at the boundary); [`run_bulk_stream`] owns the
+/// entire nusb transfer-pool loop.
+///
+/// [`run_bulk_stream`]: UsbTransport::run_bulk_stream
 pub(crate) trait UsbTransport: Send + Sync + std::fmt::Debug {
-    /// `libusb_control_transfer`, host-to-device.
+    /// `libusb_control_transfer`, host-to-device. Returns the number of
+    /// bytes accepted by the device.
     fn write_control(
         &self,
         request_type: u8,
@@ -19,9 +47,10 @@ pub(crate) trait UsbTransport: Send + Sync + std::fmt::Debug {
         index: u16,
         buf: &[u8],
         timeout: Duration,
-    ) -> rusb::Result<usize>;
+    ) -> Result<usize>;
 
-    /// `libusb_control_transfer`, device-to-host.
+    /// `libusb_control_transfer`, device-to-host. Returns the number of
+    /// bytes read into `buf`.
     fn read_control(
         &self,
         request_type: u8,
@@ -30,62 +59,229 @@ pub(crate) trait UsbTransport: Send + Sync + std::fmt::Debug {
         index: u16,
         buf: &mut [u8],
         timeout: Duration,
-    ) -> rusb::Result<usize>;
+    ) -> Result<usize>;
 
-    /// Synchronous bulk read on the sample endpoint.
-    fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> rusb::Result<usize>;
+    /// `libusb_clear_halt` on the given endpoint (`airspy_set_samplerate`
+    /// clears the bulk-IN halt before its request; C ignores the result).
+    fn clear_halt(&self, endpoint: u8) -> Result<()>;
 
-    /// `libusb_clear_halt`.
-    fn clear_halt(&self, endpoint: u8) -> rusb::Result<()>;
+    /// Run the whole bulk-streaming loop until `!shared.running()`,
+    /// keeping [`TRANSFER_COUNT`] transfers in flight and pushing each
+    /// completed [`BUFFER_SIZE`]-byte buffer into `shared.queue`. On
+    /// return, `streaming` is cleared and the queue is shut down.
+    fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared);
 
-    /// `libusb_release_interface` (the close half of
-    /// `airspy_open_exit`; the handle itself closes on drop).
-    fn release_interface(&self, iface: u8) -> rusb::Result<()>;
+    /// `libusb_release_interface` (the close half of `airspy_open_exit`).
+    /// nusb releases a claimed interface when the `Interface` drops, so
+    /// production needs no explicit call; the seam is kept for the mock.
+    fn release_interface(&self, iface: u8) -> Result<()>;
 }
 
-impl UsbTransport for rusb::DeviceHandle<rusb::Context> {
+/// Production transport: a claimed `nusb::Interface`.
+///
+/// `nusb::Interface` is `Send + Sync` and cheap to clone (an `Arc`
+/// internally), but it is not `Debug`, so the impl below is hand-rolled.
+pub(crate) struct NusbTransport {
+    interface: nusb::Interface,
+}
+
+impl NusbTransport {
+    pub(crate) fn new(interface: nusb::Interface) -> Self {
+        Self { interface }
+    }
+}
+
+impl std::fmt::Debug for NusbTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NusbTransport").finish_non_exhaustive()
+    }
+}
+
+impl UsbTransport for NusbTransport {
     fn write_control(
         &self,
-        request_type: u8,
+        _request_type: u8,
         request: u8,
         value: u16,
         index: u16,
         buf: &[u8],
         timeout: Duration,
-    ) -> rusb::Result<usize> {
-        rusb::DeviceHandle::write_control(self, request_type, request, value, index, buf, timeout)
+    ) -> Result<usize> {
+        // The driver only ever issues vendor requests to the device
+        // recipient; direction is carried by control_out vs control_in,
+        // so the `request_type` byte (0x40) is redundant here.
+        self.interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request,
+                    value,
+                    index,
+                    data: buf,
+                },
+                timeout,
+            )
+            .wait()?;
+        // libusb/rusb report the byte count moved; a successful nusb
+        // control_out transferred the whole payload.
+        Ok(buf.len())
     }
 
     fn read_control(
         &self,
-        request_type: u8,
+        _request_type: u8,
         request: u8,
         value: u16,
         index: u16,
         buf: &mut [u8],
         timeout: Duration,
-    ) -> rusb::Result<usize> {
-        rusb::DeviceHandle::read_control(self, request_type, request, value, index, buf, timeout)
+    ) -> Result<usize> {
+        let length = u16::try_from(buf.len()).unwrap_or(u16::MAX);
+        let data = self
+            .interface
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Device,
+                    request,
+                    value,
+                    index,
+                    length,
+                },
+                timeout,
+            )
+            .wait()?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
     }
 
-    fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> rusb::Result<usize> {
-        rusb::DeviceHandle::read_bulk(self, endpoint, buf, timeout)
+    fn clear_halt(&self, endpoint: u8) -> Result<()> {
+        // libusb_clear_halt sends a standard CLEAR_FEATURE(ENDPOINT_HALT)
+        // control request to the endpoint. Sending it as a control
+        // transfer (rather than claiming the endpoint via nusb's
+        // Endpoint::clear_halt) mirrors the wire behavior and does not
+        // conflict with the streaming reader's exclusive endpoint claim.
+        const CLEAR_FEATURE: u8 = 0x01;
+        const ENDPOINT_HALT: u16 = 0x0000;
+        self.interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Standard,
+                    recipient: Recipient::Endpoint,
+                    request: CLEAR_FEATURE,
+                    value: ENDPOINT_HALT,
+                    index: u16::from(endpoint),
+                    data: &[],
+                },
+                CLEAR_HALT_TIMEOUT,
+            )
+            .wait()?;
+        Ok(())
     }
 
-    fn clear_halt(&self, endpoint: u8) -> rusb::Result<()> {
-        rusb::DeviceHandle::clear_halt(self, endpoint)
+    fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared) {
+        run_bulk_stream_impl(&self.interface, endpoint, shared);
     }
 
-    fn release_interface(&self, iface: u8) -> rusb::Result<()> {
-        rusb::DeviceHandle::release_interface(self, iface)
+    fn release_interface(&self, _iface: u8) -> Result<()> {
+        // nusb releases the claimed interface when the `Interface` (held
+        // by this transport) drops. No explicit release call exists.
+        Ok(())
     }
+}
+
+/// The nusb transfer-pool reader — `airspy.c`'s `transfer_threadproc` +
+/// `airspy_libusb_transfer_callback`, keeping [`TRANSFER_COUNT`]
+/// 262144-byte bulk transfers in flight and resubmitting each on
+/// completion so the pipe never starves.
+fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &StreamShared) {
+    // Open the bulk-IN endpoint. A failure here can't stream anything,
+    // so clear streaming and shut the queue down before returning.
+    let mut ep = match interface.endpoint::<Bulk, In>(endpoint) {
+        Ok(ep) => ep,
+        Err(err) => {
+            tracing::warn!(?err, "failed to open bulk endpoint; stream not started");
+            shared.streaming.store(false, Ordering::SeqCst);
+            shared.queue.shutdown();
+            return;
+        }
+    };
+
+    // C clears the endpoint halt before streaming and ignores the result.
+    let _ = ep.clear_halt().wait();
+
+    // Prime the pool: TRANSFER_COUNT outstanding transfers, as in
+    // airspy.c's create_transfers loop.
+    for _ in 0..TRANSFER_COUNT {
+        let buf = ep.allocate(BUFFER_SIZE);
+        ep.submit(buf);
+    }
+
+    while shared.running() {
+        // `None` is a client-side timeout: the transfer stays pending,
+        // and the C event loop tolerates it and keeps polling.
+        let Some(c) = ep.wait_next_complete(EVENT_TIMEOUT) else {
+            continue;
+        };
+        match c.status {
+            // A complete BUFFER_SIZE transfer: hand it to the consumer
+            // WITHOUT blocking — if the consumer is behind, drop it
+            // (SampleQueue counts the drop) rather than stall the pool.
+            // Then resubmit the same buffer so it stays in flight.
+            Ok(()) if c.buffer.len() == BUFFER_SIZE => {
+                if let Some(mut qbuf) = shared.queue.try_acquire_free() {
+                    qbuf.copy_from_slice(&c.buffer[..]);
+                    shared.queue.push_filled(qbuf);
+                }
+                ep.submit(c.buffer);
+            }
+            // C requires actual_length == length; a short transfer stops
+            // streaming.
+            Ok(()) => {
+                tracing::warn!(
+                    bytes = c.buffer.len(),
+                    expected = BUFFER_SIZE,
+                    "short bulk transfer; stopping stream"
+                );
+                break;
+            }
+            // A stall clears and the buffer resubmits (C resets the
+            // endpoint and keeps going).
+            Err(TransferError::Stall) => {
+                let _ = ep.clear_halt().wait();
+                ep.submit(c.buffer);
+            }
+            Err(err) => {
+                tracing::warn!(?err, "bulk transfer failed; stopping stream");
+                break;
+            }
+        }
+    }
+
+    // Teardown: cancel outstanding transfers and drain their completions
+    // so the endpoint and its buffers release cleanly before the
+    // Endpoint drops.
+    ep.cancel_all();
+    while ep.pending() > 0 {
+        if ep.wait_next_complete(EVENT_TIMEOUT).is_none() {
+            break;
+        }
+    }
+    shared.streaming.store(false, Ordering::SeqCst);
+    shared.queue.shutdown();
 }
 
 #[cfg(test)]
 pub(crate) mod mock {
     use super::UsbTransport;
+    use crate::error::{Error, Result};
+    use crate::stream::{BUFFER_SIZE, EVENT_TIMEOUT, StreamShared};
+    use nusb::transfer::TransferError;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     /// C-defined wire expectations for boundary tests — transcribed
@@ -161,10 +357,10 @@ pub(crate) mod mock {
 
     /// Poll delay served while the bulk script is exhausted — a
     /// mock-only pacing value with no C equivalent (the real device
-    /// blocks in libusb instead).
+    /// blocks in nusb's `wait_next_complete` instead).
     const EXHAUSTED_BULK_POLL: Duration = Duration::from_millis(5);
 
-    /// One recorded bulk read's parameters.
+    /// One recorded (simulated) bulk transfer's parameters.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) struct BulkCall {
         pub(crate) endpoint: u8,
@@ -187,20 +383,19 @@ pub(crate) mod mock {
     /// A scripted response for one control transfer, consumed in
     /// order. `Ok` carries bytes to return: for IN requests they fill
     /// the caller's buffer; for OUT requests the value is the
-    /// transferred-byte count.
-    type Scripted = rusb::Result<Vec<u8>>;
+    /// transferred-byte count. `Err` is mapped to [`Error::Transfer`].
+    type Scripted = core::result::Result<Vec<u8>, TransferError>;
 
-    /// One scripted bulk-read outcome.
+    /// One scripted bulk outcome delivered by the mock streaming loop.
     #[derive(Debug, Clone)]
     pub(crate) enum BulkRead {
-        /// Fill the whole buffer with this byte (a complete transfer).
+        /// Deliver a complete buffer filled with this byte.
         Fill(u8),
-        /// Transfer only this many bytes — clamped to strictly less
-        /// than the buffer length so a mis-scripted value can never
-        /// masquerade as a complete transfer.
+        /// A short transfer of this many bytes — treated as a stop, like
+        /// the nusb reader's `actual_length != length` path.
         Short(usize),
-        /// Fail with this USB error.
-        Fail(rusb::Error),
+        /// Fail with this transfer error — treated as a stop.
+        Fail(TransferError),
     }
 
     /// Recording, scriptable [`UsbTransport`] for boundary tests.
@@ -226,17 +421,17 @@ pub(crate) mod mock {
         }
 
         /// Queue scripted responses for control READS (consumed FIFO).
-        /// Unscripted reads fail with `NoDevice` so missing
+        /// Unscripted reads fail with `Disconnected` so missing
         /// expectations surface loudly; `Ok` bytes fill the caller's
         /// buffer.
         pub(crate) fn script_reads(&self, responses: Vec<Scripted>) {
             *self.read_responses.lock().expect("mock lock") = responses.into();
         }
 
-        /// Queue bulk-read outcomes (consumed FIFO); once exhausted,
-        /// further reads time out — which the reader loop tolerates —
-        /// so the stream stays alive for the consumer to drain
-        /// (terminal outcomes are scripted explicitly).
+        /// Queue bulk outcomes (consumed FIFO); once exhausted, the mock
+        /// streaming loop emulates a tolerated client timeout — which
+        /// keeps the stream alive for the consumer to drain — so
+        /// terminal outcomes must be scripted explicitly.
         pub(crate) fn script_bulk(&self, reads: Vec<BulkRead>) {
             *self.bulk.lock().expect("mock lock") = reads.into();
         }
@@ -265,7 +460,7 @@ pub(crate) mod mock {
             index: u16,
             buf: &[u8],
             timeout: Duration,
-        ) -> rusb::Result<usize> {
+        ) -> Result<usize> {
             self.calls.lock().expect("mock lock").push(ControlCall {
                 request_type,
                 request,
@@ -277,7 +472,7 @@ pub(crate) mod mock {
             match self.next_write_response() {
                 None => Ok(buf.len()),
                 Some(Ok(bytes)) => Ok(bytes.len()),
-                Some(Err(e)) => Err(e),
+                Some(Err(e)) => Err(Error::from(e)),
             }
         }
 
@@ -289,7 +484,7 @@ pub(crate) mod mock {
             index: u16,
             buf: &mut [u8],
             timeout: Duration,
-        ) -> rusb::Result<usize> {
+        ) -> Result<usize> {
             self.calls.lock().expect("mock lock").push(ControlCall {
                 request_type,
                 request,
@@ -301,51 +496,63 @@ pub(crate) mod mock {
             match self.next_read_response() {
                 // Unscripted reads fail loudly: silently returning
                 // zeroed data would hide missing test expectations.
-                None => Err(rusb::Error::NoDevice),
+                None => Err(Error::from(TransferError::Disconnected)),
                 Some(Ok(bytes)) => {
                     let n = bytes.len().min(buf.len());
                     buf[..n].copy_from_slice(&bytes[..n]);
                     Ok(n)
                 }
-                Some(Err(e)) => Err(e),
+                Some(Err(e)) => Err(Error::from(e)),
             }
         }
 
-        fn read_bulk(
-            &self,
-            endpoint: u8,
-            buf: &mut [u8],
-            timeout: Duration,
-        ) -> rusb::Result<usize> {
-            self.bulk_calls.lock().expect("mock lock").push(BulkCall {
-                endpoint,
-                buf_len: buf.len(),
-                timeout,
-            });
-            match self.bulk.lock().expect("mock lock").pop_front() {
-                Some(BulkRead::Fill(byte)) => {
-                    buf.fill(byte);
-                    Ok(buf.len())
-                }
-                // Strictly shorter than the buffer, per the variant's
-                // contract.
-                Some(BulkRead::Short(n)) => Ok(n.min(buf.len().saturating_sub(1))),
-                Some(BulkRead::Fail(e)) => Err(e),
-                // Exhausted script: keep the stream alive via the
-                // tolerated timeout path (brief sleep avoids a busy
-                // poll loop).
-                None => {
-                    std::thread::sleep(EXHAUSTED_BULK_POLL);
-                    Err(rusb::Error::Timeout)
-                }
-            }
-        }
-
-        fn clear_halt(&self, _endpoint: u8) -> rusb::Result<()> {
+        fn clear_halt(&self, _endpoint: u8) -> Result<()> {
             Ok(())
         }
 
-        fn release_interface(&self, _iface: u8) -> rusb::Result<()> {
+        fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared) {
+            // Walk the scripted sequence through the same SampleQueue
+            // handoff the nusb reader uses: NON-BLOCKING acquire → drop
+            // when the consumer is behind (never block, never stall).
+            while shared.running() {
+                // Record the simulated transfer's C parameters for the
+                // wire-contract test.
+                self.bulk_calls.lock().expect("mock lock").push(BulkCall {
+                    endpoint,
+                    buf_len: BUFFER_SIZE,
+                    timeout: EVENT_TIMEOUT,
+                });
+                let next = self.bulk.lock().expect("mock lock").pop_front();
+                match next {
+                    Some(BulkRead::Fill(byte)) => {
+                        if let Some(mut qbuf) = shared.queue.try_acquire_free() {
+                            qbuf.fill(byte);
+                            shared.queue.push_filled(qbuf);
+                        }
+                        // else: consumer behind → drop (queue counts it).
+                    }
+                    Some(BulkRead::Short(n)) => {
+                        tracing::warn!(
+                            bytes = n,
+                            expected = BUFFER_SIZE,
+                            "short bulk transfer; stopping stream"
+                        );
+                        break;
+                    }
+                    Some(BulkRead::Fail(err)) => {
+                        tracing::warn!(?err, "bulk transfer failed; stopping stream");
+                        break;
+                    }
+                    // Exhausted script: emulate a tolerated client timeout
+                    // (nusb's wait_next_complete → None) and keep going.
+                    None => std::thread::sleep(EXHAUSTED_BULK_POLL),
+                }
+            }
+            shared.streaming.store(false, Ordering::SeqCst);
+            shared.queue.shutdown();
+        }
+
+        fn release_interface(&self, _iface: u8) -> Result<()> {
             Ok(())
         }
     }

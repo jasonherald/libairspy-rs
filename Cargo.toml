@@ -17,7 +17,7 @@ repository = "https://github.com/jasonherald/libairspy-rs"
 libairspy-rs = { path = "crates/libairspy", version = "0.1.0" }
 
 # USB + core
-rusb = "0.9"
+nusb = "0.2.7"
 thiserror = "2"
 tracing = "0.1"
 

@@ -28,9 +28,16 @@ pub enum Error {
     /// `AIRSPY_ERROR_UNSUPPORTED` (-12)
     #[error("AIRSPY_ERROR_UNSUPPORTED (-12): operation unsupported")]
     Unsupported,
-    /// `AIRSPY_ERROR_LIBUSB` (-1000), carrying the underlying USB error.
+    /// `AIRSPY_ERROR_LIBUSB` (-1000), carrying an underlying `nusb`
+    /// device/enumeration error (open, claim, configuration, clear-halt).
     #[error("AIRSPY_ERROR_LIBUSB (-1000): {0}")]
-    Usb(#[from] rusb::Error),
+    Usb(#[from] nusb::Error),
+    /// `AIRSPY_ERROR_LIBUSB` (-1000), carrying an underlying `nusb`
+    /// transfer error (control or bulk completion). C folds every libusb
+    /// failure into `AIRSPY_ERROR_LIBUSB`; both USB variants keep that
+    /// code/name for reporting parity.
+    #[error("AIRSPY_ERROR_LIBUSB (-1000): {0}")]
+    Transfer(#[from] nusb::transfer::TransferError),
     /// A control transfer moved a different byte count than the
     /// request required — usually short, but C's `result != 0` check
     /// on empty requests also lands here with `actual > expected`.
@@ -70,7 +77,7 @@ impl Error {
             Self::Busy => -6,
             Self::NoMem => -11,
             Self::Unsupported => -12,
-            Self::Usb(_) | Self::TransferLengthMismatch { .. } => -1000,
+            Self::Usb(_) | Self::Transfer(_) | Self::TransferLengthMismatch { .. } => -1000,
             Self::Thread => -1001,
             Self::StreamingThread => -1002,
             Self::StreamingStopped => -1003,
@@ -90,7 +97,9 @@ impl Error {
             // airspy_error_name(), so C returns its default string; we
             // replicate that for output parity with the C tools.
             Self::Unsupported => "airspy unknown error",
-            Self::Usb(_) | Self::TransferLengthMismatch { .. } => "AIRSPY_ERROR_LIBUSB",
+            Self::Usb(_) | Self::Transfer(_) | Self::TransferLengthMismatch { .. } => {
+                "AIRSPY_ERROR_LIBUSB"
+            }
             Self::Thread => "AIRSPY_ERROR_THREAD",
             Self::StreamingThread => "AIRSPY_ERROR_STREAMING_THREAD_ERR",
             Self::StreamingStopped => "AIRSPY_ERROR_STREAMING_STOPPED",
@@ -111,7 +120,10 @@ mod tests {
         assert_eq!(Error::Busy.code(), -6);
         assert_eq!(Error::NoMem.code(), -11);
         assert_eq!(Error::Unsupported.code(), -12);
-        assert_eq!(Error::Usb(rusb::Error::Io).code(), -1000);
+        assert_eq!(
+            Error::Transfer(nusb::transfer::TransferError::Fault).code(),
+            -1000
+        );
         assert_eq!(Error::Thread.code(), -1001);
         assert_eq!(Error::StreamingThread.code(), -1002);
         assert_eq!(Error::StreamingStopped.code(), -1003);
@@ -130,7 +142,10 @@ mod tests {
         // switch — it falls through to the default branch. C-exact means
         // replicating that quirk.
         assert_eq!(Error::Unsupported.name(), "airspy unknown error");
-        assert_eq!(Error::Usb(rusb::Error::Io).name(), "AIRSPY_ERROR_LIBUSB");
+        assert_eq!(
+            Error::Transfer(nusb::transfer::TransferError::Fault).name(),
+            "AIRSPY_ERROR_LIBUSB"
+        );
         assert_eq!(Error::Thread.name(), "AIRSPY_ERROR_THREAD");
         assert_eq!(
             Error::StreamingThread.name(),
@@ -159,9 +174,10 @@ mod tests {
     }
 
     #[test]
-    fn rusb_errors_convert_into_usb_variant() {
-        let err: Error = rusb::Error::NoDevice.into();
-        assert!(matches!(err, Error::Usb(rusb::Error::NoDevice)));
+    fn transfer_errors_convert_into_transfer_variant() {
+        use nusb::transfer::TransferError;
+        let err: Error = TransferError::Stall.into();
+        assert!(matches!(err, Error::Transfer(TransferError::Stall)));
     }
 
     #[test]

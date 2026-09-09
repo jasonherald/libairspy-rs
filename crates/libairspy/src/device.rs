@@ -6,14 +6,14 @@
 //! closes the handle. The Android `airspy_open_fd` path is out of
 //! scope (see the design spec).
 
-use rusb::UsbContext as _;
+use nusb::MaybeFuture as _;
 
 use std::sync::Arc;
 
 use crate::commands::{Command, SampleType};
 use crate::error::{Error, Result};
 use crate::stream::StreamWorkers;
-use crate::transport::UsbTransport;
+use crate::transport::{NusbTransport, UsbTransport};
 
 /// USB vendor id (`airspy_usb_vid` in airspy.c).
 pub const AIRSPY_USB_VID: u16 = 0x1d50;
@@ -101,7 +101,7 @@ fn parse_serial(descriptor: &str) -> Option<u64> {
     // C reads through libusb_get_string_descriptor_ascii into a
     // 27-byte buffer, which writes at most 26 chars — an over-long
     // descriptor arrives truncated to exactly SERIAL_EXPECTED_LEN and
-    // is accepted. rusb returns the full string, so truncate to match.
+    // is accepted. nusb returns the full string, so truncate to match.
     // `get` refuses (rather than panicking) if a cut lands off a
     // character boundary; the descriptor is ASCII in practice.
     let descriptor = descriptor.get(..SERIAL_EXPECTED_LEN)?;
@@ -147,47 +147,24 @@ fn strtoull_16(s: &str) -> Option<u64> {
     })
 }
 
-/// Read and parse the serial descriptor of an open handle. `None`
-/// mirrors every C skip-path: no descriptor index, read failure, wrong
-/// length, or unparseable digits.
-fn read_serial<T: rusb::UsbContext>(
-    handle: &rusb::DeviceHandle<T>,
-    descriptor: &rusb::DeviceDescriptor,
-) -> Option<u64> {
-    let serial = handle.read_serial_number_string_ascii(descriptor).ok()?;
-    parse_serial(&serial)
-}
-
-/// Enumerate connected devices matching the Airspy VID/PID, yielding
-/// each with its descriptor. Centralizes the filter both
-/// `airspy_list_devices` and `airspy_open_device` perform in C.
-fn airspy_devices(
-    context: &rusb::Context,
-) -> Result<Vec<(rusb::Device<rusb::Context>, rusb::DeviceDescriptor)>> {
-    let devices = context.devices().map_err(|_| Error::NotFound)?;
-    Ok(devices
-        .iter()
-        .filter_map(|dev| {
-            let descriptor = dev.device_descriptor().ok()?;
-            (descriptor.vendor_id() == AIRSPY_USB_VID && descriptor.product_id() == AIRSPY_USB_PID)
-                .then_some((dev, descriptor))
-        })
-        .collect())
+/// Enumerate connected devices matching the Airspy VID/PID via nusb.
+/// Centralizes the filter both `airspy_list_devices` and
+/// `airspy_open_device` perform in C. nusb surfaces the serial-number
+/// string descriptor at enumeration time, so no device open is needed to
+/// read it (unlike the rusb path this replaces).
+fn airspy_devices() -> Result<impl Iterator<Item = nusb::DeviceInfo>> {
+    Ok(nusb::list_devices()
+        .wait()?
+        .filter(|info| info.vendor_id() == AIRSPY_USB_VID && info.product_id() == AIRSPY_USB_PID))
 }
 
 /// List the serial numbers of all connected Airspy devices, mirroring
 /// `airspy_list_devices` (devices whose serial cannot be read or
 /// parsed are skipped, as in C).
 pub fn list_devices() -> Result<Vec<u64>> {
-    let context = rusb::Context::new()?;
-    let mut serials = Vec::new();
-    for (dev, descriptor) in airspy_devices(&context)? {
-        let Ok(handle) = dev.open() else { continue };
-        if let Some(serial) = read_serial(&handle, &descriptor) {
-            serials.push(serial);
-        }
-    }
-    Ok(serials)
+    Ok(airspy_devices()?
+        .filter_map(|info| info.serial_number().and_then(parse_serial))
+        .collect())
 }
 
 /// An open Airspy device with interface 0 claimed.
@@ -233,24 +210,29 @@ impl Device {
     }
 
     fn open_impl(serial_number: Option<u64>) -> Result<Self> {
-        let context = rusb::Context::new()?;
-        for (dev, descriptor) in airspy_devices(&context)? {
-            let Ok(mut handle) = dev.open() else { continue };
+        for info in airspy_devices()? {
             if let Some(wanted) = serial_number {
                 // C additionally requires iSerialNumber > 0 and the
-                // exact expected descriptor length; read_serial folds
+                // exact expected descriptor length; parse_serial folds
                 // those into its None path.
-                match read_serial(&handle, &descriptor) {
+                match info.serial_number().and_then(parse_serial) {
                     Some(serial) if serial == wanted => {}
                     _ => continue,
                 }
             }
-            if Self::configure(&mut handle).is_err() {
+            let Ok(device) = info.open().wait() else {
+                // C closes the handle and keeps scanning on any open
+                // failure.
+                continue;
+            };
+            let Ok(interface) = Self::configure(&device) else {
                 // C closes the handle and keeps scanning on any
                 // configuration/claim failure.
                 continue;
-            }
-            return Ok(Self::from_transport(Arc::new(handle)));
+            };
+            return Ok(Self::from_transport(Arc::new(NusbTransport::new(
+                interface,
+            ))));
         }
         Err(Error::NotFound)
     }
@@ -366,21 +348,28 @@ impl Device {
 
     /// Kernel-driver detach + `set_configuration(1)` +
     /// `claim_interface(0)`, exactly as `airspy_open_device` does.
-    fn configure(handle: &mut rusb::DeviceHandle<rusb::Context>) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        if handle.kernel_driver_active(USB_INTERFACE).unwrap_or(false) {
-            let _ = handle.detach_kernel_driver(USB_INTERFACE);
+    ///
+    /// nusb's `detach_and_claim_interface` performs the Linux-only
+    /// kernel-driver detach; the configuration is (re)set only when it
+    /// isn't already active, mirroring rusb's `set_active_configuration`
+    /// and avoiding a needless device reset.
+    fn configure(device: &nusb::Device) -> Result<nusb::Interface> {
+        let active = device
+            .active_configuration()
+            .map_or(0, |config| config.configuration_value());
+        if active != USB_CONFIGURATION {
+            device.set_configuration(USB_CONFIGURATION).wait()?;
         }
-        handle.set_active_configuration(USB_CONFIGURATION)?;
-        handle.claim_interface(USB_INTERFACE)?;
-        Ok(())
+        Ok(device.detach_and_claim_interface(USB_INTERFACE).wait()?)
     }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // airspy_close stops streaming before airspy_open_exit
-        // releases interface 0; rusb's own Drop closes the handle.
+        // airspy_close stops streaming before airspy_open_exit releases
+        // interface 0. release_interface is a no-op for the nusb
+        // transport — dropping the Arc'd Interface (with this Device)
+        // releases the claim and closes the handle.
         let _ = self.stop_rx();
         let _ = self.handle.release_interface(USB_INTERFACE);
     }
@@ -428,7 +417,7 @@ mod tests {
     fn truncates_overlong_serial_like_c_buffer() {
         // libusb_get_string_descriptor_ascii writes at most 26 chars
         // into C's buffer, so a longer descriptor is truncated to 26
-        // and accepted; rusb returns the whole string and we must
+        // and accepted; nusb returns the whole string and we must
         // truncate to match.
         assert_eq!(
             parse_serial("AIRSPY SN:0123456789ABCDEF0"),
