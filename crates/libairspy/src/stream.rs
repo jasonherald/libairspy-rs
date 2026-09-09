@@ -651,13 +651,17 @@ mod tests {
     }
 
     #[test]
-    fn bulk_error_stops_stream() {
+    fn disconnect_stops_stream() {
         use crate::commands::SampleType;
         use crate::device::Device;
         use crate::transport::mock::{BulkRead, MockTransport};
 
+        // Disconnected is the ONLY fatal transfer error: the device is
+        // really gone, so the stream must stop.
         let transport = Arc::new(MockTransport::default());
-        transport.script_bulk(vec![BulkRead::Fail(nusb::transfer::TransferError::Fault)]);
+        transport.script_bulk(vec![BulkRead::Fail(
+            nusb::transfer::TransferError::Disconnected,
+        )]);
         let mut device = Device::from_transport(transport as Arc<_>);
         device.set_sample_type(SampleType::Raw).expect("set type");
         device.start_rx(|_| true).expect("start_rx");
@@ -666,8 +670,53 @@ mod tests {
         while device.is_streaming() && std::time::Instant::now() < deadline {
             std::thread::sleep(core::time::Duration::from_millis(10));
         }
-        assert!(!device.is_streaming(), "bulk error must stop the stream");
+        assert!(!device.is_streaming(), "a disconnect must stop the stream");
         device.stop_rx().expect("stop");
+    }
+
+    #[test]
+    fn transient_error_does_not_stop_stream() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+        use std::sync::mpsc;
+
+        // A transient Fault (the ~28s-under-load case from real
+        // hardware) must NOT kill the stream: the faulted buffer is
+        // dropped, and subsequent transfers keep delivering.
+        let transport = Arc::new(MockTransport::default());
+        transport.script_bulk(vec![
+            BulkRead::Fail(nusb::transfer::TransferError::Fault),
+            BulkRead::Fill(0xAB),
+            BulkRead::Fill(0xCD),
+        ]);
+        let mut device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+
+        let (tx, rx) = mpsc::channel();
+        device
+            .start_rx(move |transfer| {
+                let Samples::Raw(bytes) = transfer.samples else {
+                    unreachable!("RAW stream");
+                };
+                tx.send(bytes[0]).is_ok()
+            })
+            .expect("start_rx");
+
+        // The fault is dropped (no delivery); the two fills after it
+        // still arrive, proving the stream tolerated the error.
+        for expected in [0xAB, 0xCD] {
+            let first = rx
+                .recv_timeout(core::time::Duration::from_secs(5))
+                .expect("delivery after a tolerated transient error");
+            assert_eq!(first, expected);
+        }
+        assert!(
+            device.is_streaming(),
+            "a transient transfer error must not stop the stream"
+        );
+        device.stop_rx().expect("stop");
+        assert!(!device.is_streaming());
     }
 
     #[test]
@@ -720,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn short_bulk_read_stops_stream_without_delivery() {
+    fn short_bulk_read_delivers_nothing_but_keeps_streaming() {
         use crate::commands::SampleType;
         use crate::device::Device;
         use crate::transport::mock::{BulkRead, MockTransport};
@@ -736,18 +785,19 @@ mod tests {
             .start_rx(move |_| tx.send(()).is_ok())
             .expect("start_rx");
 
-        // C requires actual_length == length: the short read delivers
-        // nothing and terminates the stream.
+        // A short transfer (actual_length != length) delivers nothing,
+        // but is now treated as transient — the stream stays alive
+        // instead of stopping.
         assert!(
             rx.recv_timeout(core::time::Duration::from_millis(500))
                 .is_err(),
             "no callback for a short transfer"
         );
-        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
-        while device.is_streaming() && std::time::Instant::now() < deadline {
-            std::thread::sleep(core::time::Duration::from_millis(10));
-        }
-        assert!(!device.is_streaming());
+        assert!(
+            device.is_streaming(),
+            "a short transfer must not stop the stream"
+        );
         device.stop_rx().expect("stop");
+        assert!(!device.is_streaming());
     }
 }
