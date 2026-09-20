@@ -414,10 +414,14 @@ pub(crate) mod mock {
     pub(crate) enum BulkRead {
         /// Deliver a complete buffer filled with this byte.
         Fill(u8),
-        /// A short transfer of this many bytes — treated as a stop, like
-        /// the nusb reader's `actual_length != length` path.
+        /// A short transfer of this many bytes — treated as a *transient*
+        /// error by the resilient reader: the buffer is dropped and the
+        /// stream keeps going (it does not stop).
         Short(usize),
-        /// Fail with this transfer error — treated as a stop.
+        /// Fail with this transfer error. The reader stops **only** on
+        /// [`TransferError::Disconnected`]; every other error is transient
+        /// (dropped and resubmitted, the stream continues). Script
+        /// `Fail(TransferError::Disconnected)` to drive a stop.
         Fail(TransferError),
     }
 

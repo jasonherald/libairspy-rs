@@ -29,7 +29,9 @@ pub enum Error {
     #[error("AIRSPY_ERROR_UNSUPPORTED (-12): operation unsupported")]
     Unsupported,
     /// `AIRSPY_ERROR_LIBUSB` (-1000), carrying an underlying `nusb`
-    /// device/enumeration error (open, claim, configuration, clear-halt).
+    /// device/enumeration error (open, claim, configuration). Clear-halt
+    /// goes through `Interface::control_out`, so its failures surface as
+    /// [`Error::Transfer`], not this variant.
     #[error("AIRSPY_ERROR_LIBUSB (-1000): {0}")]
     Usb(#[from] nusb::Error),
     /// `AIRSPY_ERROR_LIBUSB` (-1000), carrying an underlying `nusb`
