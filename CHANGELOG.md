@@ -9,6 +9,38 @@ by crates.io publishes of `libairspy-rs`.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-20
+
+Driver refinements from the #74 review (deferred from 0.2.0 as issue #75).
+These change USB init/streaming behavior, so each is **re-validated on real
+Airspy hardware before this version is published**. No API changes.
+
+### Changed
+
+- **`open_serial` / `list_devices` now read the serial from the device's
+  string descriptor** (opening each candidate, as the C library does)
+  instead of trusting nusb's enumeration-time `DeviceInfo::serial_number`,
+  which can be `None` for a present device — previously dropping a
+  supported Airspy and making `open_serial` return `NotFound`.
+- **Endpoint-halt clears now use nusb's `Endpoint::clear_halt`**, which
+  resets the host-side data toggle (a bare `CLEAR_FEATURE` control transfer
+  did not). After a halt reset following bulk traffic the host/device
+  toggles could otherwise diverge and stall subsequent transfers. This is
+  the `libusb_clear_halt` behavior `airspy.c` relies on.
+- **`start_rx` clears the halt synchronously between the receiver-mode OFF
+  and RX commands** (`OFF → clear_halt → RX → threads`), matching
+  `airspy_start_rx`, instead of deferring it into the reader thread.
+
+### Fixed
+
+- **A persistent bulk-transfer error storm no longer spins the reader.** On
+  top of the immediate stop for unrecoverable `Stall`/`InvalidArgument`
+  (0.2.0), a run of consecutive non-fatal errors with no successful
+  transfer in between now stops the stream after a bounded count (with a
+  short backoff between retries). A single transient fault is still
+  tolerated — the run resets on the next good transfer.
+- **Pool-exhaustion drops** were already counted in 0.2.0; unchanged here.
+
 ## [0.2.0] - 2026-09-19
 
 Minor bump (pre-1.0 breaking, per this file's versioning note): the USB

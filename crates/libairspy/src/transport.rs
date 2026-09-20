@@ -25,9 +25,17 @@ use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient, Tr
 use crate::error::Result;
 use crate::stream::{BUFFER_SIZE, EVENT_TIMEOUT, StreamShared, TRANSFER_COUNT};
 
-/// `LIBUSB_CTRL_TIMEOUT_MS` (500) — the timeout `airspy.c` uses for the
-/// bare `libusb_clear_halt` control transfer.
-const CLEAR_HALT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Stop the stream after this many consecutive non-fatal transfer errors
+/// with no successful transfer in between. A single transient fault still
+/// resets on the next good buffer; this only fires on a *persistent*
+/// Fault/short-transfer storm, so a stuck endpoint can't spin the reader
+/// forever. Hardware-tunable (see issue #75).
+pub(crate) const MAX_CONSECUTIVE_TRANSFER_ERRORS: u64 = 64;
+
+/// Backoff before resubmitting after a non-fatal transfer error, so an
+/// error storm doesn't busy-spin the CPU. Short enough that a genuine
+/// isolated transient is imperceptible.
+const TRANSFER_ERROR_BACKOFF: Duration = Duration::from_millis(2);
 
 /// The USB operations `airspy.c` performs against an open device.
 ///
@@ -158,26 +166,19 @@ impl UsbTransport for NusbTransport {
     }
 
     fn clear_halt(&self, endpoint: u8) -> Result<()> {
-        // libusb_clear_halt sends a standard CLEAR_FEATURE(ENDPOINT_HALT)
-        // control request to the endpoint. Sending it as a control
-        // transfer (rather than claiming the endpoint via nusb's
-        // Endpoint::clear_halt) mirrors the wire behavior and does not
-        // conflict with the streaming reader's exclusive endpoint claim.
-        const CLEAR_FEATURE: u8 = 0x01;
-        const ENDPOINT_HALT: u16 = 0x0000;
-        self.interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Standard,
-                    recipient: Recipient::Endpoint,
-                    request: CLEAR_FEATURE,
-                    value: ENDPOINT_HALT,
-                    index: u16::from(endpoint),
-                    data: &[],
-                },
-                CLEAR_HALT_TIMEOUT,
-            )
-            .wait()?;
+        // libusb_clear_halt does TWO things: the standard
+        // CLEAR_FEATURE(ENDPOINT_HALT) control request AND a reset of the
+        // host-side data toggle. nusb's Endpoint::clear_halt does both; a
+        // bare control_out would send the request but leave the host
+        // toggle out of sync, so after a halt reset following bulk traffic
+        // the host/device toggles diverge and subsequent bulk transfers
+        // fail (issue #75, finding #4). We claim the endpoint transiently
+        // and drop it immediately — callers ensure the streaming reader is
+        // NOT holding it: `set_samplerate` runs while stopped, and
+        // `start_rx` clears between the receiver-mode OFF/RX commands,
+        // before the reader thread is spawned.
+        let mut ep = self.interface.endpoint::<Bulk, In>(endpoint)?;
+        ep.clear_halt().wait()?;
         Ok(())
     }
 
@@ -189,6 +190,52 @@ impl UsbTransport for NusbTransport {
         // nusb releases the claimed interface when the `Interface` (held
         // by this transport) drops. No explicit release call exists.
         Ok(())
+    }
+}
+
+/// Running tally of non-fatal transfer errors for one streaming session.
+#[derive(Default)]
+struct ErrorRun {
+    /// Every tolerated error, for the end-of-stream summary log.
+    total: u64,
+    /// Errors since the last successful full transfer. Resets on any good
+    /// delivery; bounds a persistent storm via
+    /// [`MAX_CONSECUTIVE_TRANSFER_ERRORS`].
+    consecutive: u64,
+}
+
+/// Record one non-fatal transfer error and decide whether to keep going.
+/// Returns `false` (stop the stream) once the consecutive run exceeds
+/// [`MAX_CONSECUTIVE_TRANSFER_ERRORS`]; otherwise backs off briefly and
+/// returns `true` so the caller resubmits. A single fault is invisible —
+/// the run resets on the next successful transfer.
+fn record_transient(run: &mut ErrorRun) -> bool {
+    run.total = run.total.saturating_add(1);
+    run.consecutive = run.consecutive.saturating_add(1);
+    if run.consecutive > MAX_CONSECUTIVE_TRANSFER_ERRORS {
+        tracing::warn!(
+            consecutive = run.consecutive,
+            "too many consecutive bulk transfer errors; stopping stream"
+        );
+        return false;
+    }
+    std::thread::sleep(TRANSFER_ERROR_BACKOFF);
+    true
+}
+
+/// Resubmit a transient failure's buffer and keep streaming — unless the
+/// consecutive-error run has hit the cap, in which case stop (return
+/// `false`) and let the buffer drop with the outstanding pool.
+fn resubmit_or_stop(
+    ep: &mut nusb::Endpoint<Bulk, In>,
+    buffer: nusb::transfer::Buffer,
+    run: &mut ErrorRun,
+) -> bool {
+    if record_transient(run) {
+        ep.submit(buffer);
+        true
+    } else {
+        false
     }
 }
 
@@ -209,8 +256,11 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
         }
     };
 
-    // C clears the endpoint halt before streaming and ignores the result.
-    let _ = ep.clear_halt().wait();
+    // The endpoint halt is cleared synchronously in `start_rx`, between
+    // the receiver-mode OFF and RX commands — matching airspy.c's
+    // `airspy_start_rx` order (OFF → clear_halt → RX → threads) and
+    // resetting the host data toggle via nusb's Endpoint::clear_halt
+    // before the reader claims the endpoint (issue #75, finding #3).
 
     // Prime the pool: TRANSFER_COUNT outstanding transfers, as in
     // airspy.c's create_transfers loop.
@@ -227,7 +277,7 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
     // endpoint error (Stall/InvalidArgument). (This is a deliberate
     // improvement over airspyone_host, which stops on any non-completed
     // transfer.)
-    let mut transient_errors: u64 = 0;
+    let mut run = ErrorRun::default();
 
     while shared.running() {
         // `None` is a client-side timeout: the transfer stays pending,
@@ -235,14 +285,14 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
         let Some(c) = ep.wait_next_complete(EVENT_TIMEOUT) else {
             continue;
         };
-        if !handle_bulk_completion(&mut ep, shared, c, &mut transient_errors) {
+        if !handle_bulk_completion(&mut ep, shared, c, &mut run) {
             break;
         }
     }
 
-    if transient_errors > 0 {
+    if run.total > 0 {
         tracing::info!(
-            transient_errors,
+            transient_errors = run.total,
             "stream tolerated transient transfer errors"
         );
     }
@@ -271,13 +321,15 @@ fn handle_bulk_completion(
     ep: &mut nusb::Endpoint<Bulk, In>,
     shared: &StreamShared,
     c: nusb::transfer::Completion,
-    transient_errors: &mut u64,
+    run: &mut ErrorRun,
 ) -> bool {
     match c.status {
         // A complete BUFFER_SIZE transfer: hand it to the consumer WITHOUT
         // blocking — if the consumer is behind, drop it (SampleQueue counts
         // the drop) rather than stall the pool. Then resubmit the buffer.
+        // A good transfer clears the consecutive-error run.
         Ok(()) if c.buffer.len() == BUFFER_SIZE => {
+            run.consecutive = 0;
             if let Some(mut qbuf) = shared.queue.try_acquire_free() {
                 qbuf.copy_from_slice(&c.buffer[..]);
                 shared.queue.push_filled(qbuf);
@@ -294,31 +346,26 @@ fn handle_bulk_completion(
         // fails identically on every resubmit — clear_halt cannot run with
         // other transfers in flight — so retrying would spin the reader
         // with no samples forever. Stop cleanly and let the caller restart
-        // the source. (Bounding retries of the *transient* errors below
-        // with a consecutive-error cap + backoff is tracked for a
-        // hardware-tested follow-up.)
+        // the source.
         Err(err @ (TransferError::Stall | TransferError::InvalidArgument)) => {
             tracing::warn!(?err, "unrecoverable bulk transfer error; stopping stream");
             false
         }
         // Everything else — a Fault, a spurious Cancelled while streaming,
         // or an Unknown OS error — is transient. Drop that buffer's data,
-        // do NOT push it, resubmit, and keep going.
+        // do NOT push it; resubmit and keep going, unless the consecutive
+        // run says the endpoint is stuck.
         Err(err) => {
-            *transient_errors = transient_errors.saturating_add(1);
             tracing::debug!(?err, "transient bulk transfer error; resubmitting");
-            ep.submit(c.buffer);
-            true
+            resubmit_or_stop(ep, c.buffer, run)
         }
         Ok(()) => {
-            *transient_errors = transient_errors.saturating_add(1);
             tracing::debug!(
                 bytes = c.buffer.len(),
                 expected = BUFFER_SIZE,
                 "transient short bulk transfer; resubmitting"
             );
-            ep.submit(c.buffer);
-            true
+            resubmit_or_stop(ep, c.buffer, run)
         }
     }
 }
@@ -403,6 +450,11 @@ pub(crate) mod mock {
         /// when the firmware query fails: `{10000000, 2500000}`
         /// (airspy.c).
         pub(crate) const FALLBACK_SAMPLERATES: [u32; 2] = [10_000_000, 2_500_000];
+        /// Test-only sentinel recorded by the mock's `clear_halt` so its
+        /// ordering relative to the receiver-mode control calls is
+        /// observable. Not a real vendor request (0xFE is unused by
+        /// `airspy_commands.h`).
+        pub(crate) const CLEAR_HALT_MARKER: u8 = 0xFE;
     }
 
     /// Poll delay served while the bulk script is exhausted — a
@@ -560,7 +612,17 @@ pub(crate) mod mock {
             }
         }
 
-        fn clear_halt(&self, _endpoint: u8) -> Result<()> {
+        fn clear_halt(&self, endpoint: u8) -> Result<()> {
+            // Record the call (as a sentinel ControlCall) so tests can
+            // assert it lands between the receiver-mode OFF/RX commands.
+            self.calls.lock().expect("mock lock").push(ControlCall {
+                request_type: 0,
+                request: wire::CLEAR_HALT_MARKER,
+                value: 0,
+                index: u16::from(endpoint),
+                data: Vec::new(),
+                timeout: Duration::ZERO,
+            });
             Ok(())
         }
 
@@ -572,7 +634,7 @@ pub(crate) mod mock {
             // the unrecoverable endpoint errors (Stall/InvalidArgument)
             // stop; every other error/short transfer is transient (dropped
             // + kept going).
-            let mut transient_errors: u64 = 0;
+            let mut run = super::ErrorRun::default();
             while shared.running() {
                 // Record the simulated transfer's C parameters for the
                 // wire-contract test.
@@ -582,13 +644,13 @@ pub(crate) mod mock {
                     timeout: EVENT_TIMEOUT,
                 });
                 let next = self.bulk.lock().expect("mock lock").pop_front();
-                if !handle_mock_bulk(next.as_ref(), shared, &mut transient_errors) {
+                if !handle_mock_bulk(next.as_ref(), shared, &mut run) {
                     break;
                 }
             }
-            if transient_errors > 0 {
+            if run.total > 0 {
                 tracing::info!(
-                    transient_errors,
+                    transient_errors = run.total,
                     "stream tolerated transient transfer errors"
                 );
             }
@@ -608,10 +670,11 @@ pub(crate) mod mock {
     fn handle_mock_bulk(
         next: Option<&BulkRead>,
         shared: &StreamShared,
-        transient_errors: &mut u64,
+        run: &mut super::ErrorRun,
     ) -> bool {
         match next {
             Some(BulkRead::Fill(byte)) => {
+                run.consecutive = 0;
                 if let Some(mut qbuf) = shared.queue.try_acquire_free() {
                     qbuf.fill(*byte);
                     shared.queue.push_filled(qbuf);
@@ -631,20 +694,19 @@ pub(crate) mod mock {
                 false
             }
             // A short transfer or any other non-fatal error is transient:
-            // drop it and keep streaming.
+            // drop it and keep streaming, unless the consecutive run says
+            // the endpoint is stuck (mirrors the production cap).
             Some(BulkRead::Short(n)) => {
-                *transient_errors = transient_errors.saturating_add(1);
                 tracing::debug!(
                     bytes = n,
                     expected = BUFFER_SIZE,
                     "transient short bulk transfer; resubmitting"
                 );
-                true
+                super::record_transient(run)
             }
             Some(BulkRead::Fail(err)) => {
-                *transient_errors = transient_errors.saturating_add(1);
                 tracing::debug!(?err, "transient bulk transfer error; resubmitting");
-                true
+                super::record_transient(run)
             }
             // Exhausted script: emulate a tolerated client timeout (nusb's
             // wait_next_complete → None) and keep going.
