@@ -129,6 +129,11 @@ fn high_nibble_ratio(bytes: &[u8]) -> f64 {
 mod tests {
     use super::*;
 
+    /// `SERIAL_NUMBER_UNUSED` in `airspyone_host`'s `airspy.c` — serial 0
+    /// is the "no filter" sentinel `airspy_open_sn` treats as "open the
+    /// first device", so a real device's serial must never read as 0.
+    const SERIAL_NUMBER_UNUSED: u64 = 0;
+
     #[test]
     #[ignore = "requires Airspy hardware"]
     fn enumerates_at_least_one_device() {
@@ -150,7 +155,10 @@ mod tests {
         let serials = list_devices().expect("list_devices");
         assert!(!serials.is_empty(), "no Airspy enumerated");
         for serial in serials {
-            assert_ne!(serial, 0, "serial descriptor read/parsed as zero");
+            assert_ne!(
+                serial, SERIAL_NUMBER_UNUSED,
+                "serial descriptor read/parsed as zero"
+            );
             println!("reopening discovered serial: 0x{serial:016X}");
             let device = Device::open_serial(serial)
                 .expect("open_serial with a serial that discovery just read");
