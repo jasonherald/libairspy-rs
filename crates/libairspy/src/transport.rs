@@ -234,44 +234,8 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
         let Some(c) = ep.wait_next_complete(EVENT_TIMEOUT) else {
             continue;
         };
-        match c.status {
-            // A complete BUFFER_SIZE transfer: hand it to the consumer
-            // WITHOUT blocking — if the consumer is behind, drop it
-            // (SampleQueue counts the drop) rather than stall the pool.
-            // Then resubmit the same buffer so it stays in flight.
-            Ok(()) if c.buffer.len() == BUFFER_SIZE => {
-                if let Some(mut qbuf) = shared.queue.try_acquire_free() {
-                    qbuf.copy_from_slice(&c.buffer[..]);
-                    shared.queue.push_filled(qbuf);
-                }
-                ep.submit(c.buffer);
-            }
-            // The device is really gone: the only fatal case.
-            Err(TransferError::Disconnected) => {
-                tracing::warn!("bulk endpoint disconnected; stopping stream");
-                break;
-            }
-            // Everything else — a short transfer, Fault, Stall, Cancelled
-            // (spuriously, while streaming), or an Unknown OS error — is
-            // transient. Drop that buffer's (partial/faulted) data, do
-            // NOT push it to the consumer, resubmit it, and keep going.
-            // Stall is handled here too: clear_halt cannot run with other
-            // transfers in flight, so we just resubmit best-effort rather
-            // than clearing the halt mid-stream.
-            Err(err) => {
-                transient_errors = transient_errors.saturating_add(1);
-                tracing::debug!(?err, "transient bulk transfer error; resubmitting");
-                ep.submit(c.buffer);
-            }
-            Ok(()) => {
-                transient_errors = transient_errors.saturating_add(1);
-                tracing::debug!(
-                    bytes = c.buffer.len(),
-                    expected = BUFFER_SIZE,
-                    "transient short bulk transfer; resubmitting"
-                );
-                ep.submit(c.buffer);
-            }
+        if !handle_bulk_completion(&mut ep, shared, c, &mut transient_errors) {
+            break;
         }
     }
 
@@ -294,6 +258,58 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
     }
     shared.streaming.store(false, Ordering::SeqCst);
     shared.queue.shutdown();
+}
+
+/// Handle one completed bulk transfer: hand a full `BUFFER_SIZE` buffer to
+/// the consumer without blocking (drop-and-count if it's behind) and
+/// resubmit; tolerate transient errors and short transfers (resubmit and
+/// count); stop only on a real device disconnect. Returns `false` when the
+/// stream should stop.
+fn handle_bulk_completion(
+    ep: &mut nusb::Endpoint<Bulk, In>,
+    shared: &StreamShared,
+    c: nusb::transfer::Completion,
+    transient_errors: &mut u64,
+) -> bool {
+    match c.status {
+        // A complete BUFFER_SIZE transfer: hand it to the consumer WITHOUT
+        // blocking — if the consumer is behind, drop it (SampleQueue counts
+        // the drop) rather than stall the pool. Then resubmit the buffer.
+        Ok(()) if c.buffer.len() == BUFFER_SIZE => {
+            if let Some(mut qbuf) = shared.queue.try_acquire_free() {
+                qbuf.copy_from_slice(&c.buffer[..]);
+                shared.queue.push_filled(qbuf);
+            }
+            ep.submit(c.buffer);
+            true
+        }
+        // The device is really gone: the only fatal case.
+        Err(TransferError::Disconnected) => {
+            tracing::warn!("bulk endpoint disconnected; stopping stream");
+            false
+        }
+        // Everything else — a short transfer, Fault, Stall, Cancelled
+        // (spuriously, while streaming), or an Unknown OS error — is
+        // transient. Drop that buffer's data, do NOT push it, resubmit, and
+        // keep going. (Stall included: clear_halt cannot run with other
+        // transfers in flight, so we resubmit best-effort instead.)
+        Err(err) => {
+            *transient_errors = transient_errors.saturating_add(1);
+            tracing::debug!(?err, "transient bulk transfer error; resubmitting");
+            ep.submit(c.buffer);
+            true
+        }
+        Ok(()) => {
+            *transient_errors = transient_errors.saturating_add(1);
+            tracing::debug!(
+                bytes = c.buffer.len(),
+                expected = BUFFER_SIZE,
+                "transient short bulk transfer; resubmitting"
+            );
+            ep.submit(c.buffer);
+            true
+        }
+    }
 }
 
 #[cfg(test)]

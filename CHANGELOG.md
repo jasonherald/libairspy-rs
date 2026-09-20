@@ -9,7 +9,10 @@ by crates.io publishes of `libairspy-rs`.
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-09-19
+## [0.2.0] - 2026-09-19
+
+Minor bump (pre-1.0 breaking, per this file's versioning note): the USB
+backend swap changes the error types carried by `Error`.
 
 ### Changed
 
@@ -17,7 +20,12 @@ by crates.io publishes of `libairspy-rs`.
   no-C-dependency async USB stack. The streaming reader now keeps a pool of
   16 bulk transfers in flight (matching the C `airspyone_host` ring) via
   nusb's `Endpoint` submit / `wait_next_complete` / resubmit loop, replacing
-  the previous single synchronous `read_bulk`. Public API unchanged.
+  the previous single synchronous `read_bulk`. The device/control/streaming
+  method surface (`open`, `start_rx`, etc.) is unchanged.
+- **BREAKING:** `Error::Usb` now wraps `nusb::Error` (was `rusb::Error`), and
+  a new `Error::Transfer(nusb::transfer::TransferError)` variant carries
+  control/bulk transfer failures. Both keep the `AIRSPY_ERROR_LIBUSB (-1000)`
+  code/name. Downstreams that matched on the inner error type must update.
 
 ### Fixed
 

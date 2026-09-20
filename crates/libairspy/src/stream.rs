@@ -5,14 +5,14 @@
 //!
 //! ## The transfer pool
 //!
-//! C queues [`TRANSFER_COUNT`] asynchronous 256 KiB URBs and swaps
+//! C queues `TRANSFER_COUNT` asynchronous 256 KiB URBs and swaps
 //! completed buffers into the ring from libusb's event loop. The reader
 //! side of that model lives behind the transport
-//! ([`UsbTransport::run_bulk_stream`](crate::transport::UsbTransport::run_bulk_stream)):
-//! the nusb backend keeps `TRANSFER_COUNT` bulk transfers in flight and
-//! resubmits each on completion, handing every full buffer into
-//! [`SampleQueue`] **non-blocking** (drop-and-count when the consumer is
-//! behind) so the pipe never starves. The ring, drop accounting, and
+//! (`UsbTransport::run_bulk_stream`): the nusb backend keeps
+//! `TRANSFER_COUNT` bulk transfers in flight and resubmits each on
+//! completion, handing every full buffer into `SampleQueue`
+//! **non-blocking** (drop-and-count when the consumer is behind) so the
+//! pipe never starves. The ring, drop accounting, and
 //! stop semantics below are shared by the production and mock readers.
 
 use std::collections::VecDeque;
