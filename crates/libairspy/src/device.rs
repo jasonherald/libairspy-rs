@@ -30,6 +30,10 @@ const SERIAL_EXPECTED_LEN: usize = 26;
 /// 0 as "no filter" and opens the first device found.
 const SERIAL_NUMBER_UNUSED: u64 = 0;
 
+/// Timeout for the serial string-descriptor reads. libusb's
+/// `libusb_get_string_descriptor_ascii` hardcodes 1000 ms; match it.
+const DESCRIPTOR_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(1);
+
 /// USB configuration selected on open (`libusb_set_configuration(dev_handle, 1)`
 /// in `airspy_open_device`).
 const USB_CONFIGURATION: u8 = 1;
@@ -149,13 +153,40 @@ fn strtoull_16(s: &str) -> Option<u64> {
 
 /// Enumerate connected devices matching the Airspy VID/PID via nusb.
 /// Centralizes the filter both `airspy_list_devices` and
-/// `airspy_open_device` perform in C. nusb surfaces the serial-number
-/// string descriptor at enumeration time, so no device open is needed to
-/// read it (unlike the rusb path this replaces).
+/// `airspy_open_device` perform in C.
 fn airspy_devices() -> Result<impl Iterator<Item = nusb::DeviceInfo>> {
     Ok(nusb::list_devices()
         .wait()?
         .filter(|info| info.vendor_id() == AIRSPY_USB_VID && info.product_id() == AIRSPY_USB_PID))
+}
+
+/// Read and parse an Airspy's serial the way the C library does
+/// (`airspy_list_devices` / `airspy_open_sn`): open the device and read
+/// its serial *string descriptor*, rather than trusting nusb's
+/// enumeration-time [`DeviceInfo::serial_number`], which can be `None`
+/// even for a present device — dropping a supported Airspy and making
+/// `open_serial` return `NotFound` (issue #75, finding #1).
+///
+/// Returns `None` when the device has no serial descriptor index, the
+/// descriptor read fails, or the string doesn't parse (mirroring C's
+/// "skip and keep scanning" on each of those).
+fn read_serial(device: &nusb::Device) -> Option<u64> {
+    // C only reads when iSerialNumber > 0.
+    let index = device.device_descriptor().serial_number_string_index()?;
+    // libusb_get_string_descriptor_ascii reads the language-ID table and
+    // uses the first entry; fall back to US English (the Airspy firmware's
+    // language) if that query fails or is empty.
+    let language_id = device
+        .get_string_descriptor_supported_languages(DESCRIPTOR_TIMEOUT)
+        .wait()
+        .ok()
+        .and_then(|mut langs| langs.next())
+        .unwrap_or(nusb::descriptors::language_id::US_ENGLISH);
+    let descriptor = device
+        .get_string_descriptor(index, language_id, DESCRIPTOR_TIMEOUT)
+        .wait()
+        .ok()?;
+    parse_serial(&descriptor)
 }
 
 /// List the serial numbers of all connected Airspy devices, mirroring
@@ -163,7 +194,7 @@ fn airspy_devices() -> Result<impl Iterator<Item = nusb::DeviceInfo>> {
 /// parsed are skipped, as in C).
 pub fn list_devices() -> Result<Vec<u64>> {
     Ok(airspy_devices()?
-        .filter_map(|info| info.serial_number().and_then(parse_serial))
+        .filter_map(|info| read_serial(&info.open().wait().ok()?))
         .collect())
 }
 
@@ -211,20 +242,22 @@ impl Device {
 
     fn open_impl(serial_number: Option<u64>) -> Result<Self> {
         for info in airspy_devices()? {
+            // C opens each candidate (to read its serial descriptor when
+            // matching) and closes+keeps scanning on any open failure.
+            let Ok(device) = info.open().wait() else {
+                continue;
+            };
             if let Some(wanted) = serial_number {
-                // C additionally requires iSerialNumber > 0 and the
-                // exact expected descriptor length; parse_serial folds
-                // those into its None path.
-                match info.serial_number().and_then(parse_serial) {
+                // Match against the serial read from the opened device's
+                // string descriptor — not the enumeration metadata, which
+                // can be missing (issue #75, finding #1). C requires
+                // iSerialNumber > 0 and the exact descriptor length;
+                // read_serial/parse_serial fold those into their None path.
+                match read_serial(&device) {
                     Some(serial) if serial == wanted => {}
                     _ => continue,
                 }
             }
-            let Ok(device) = info.open().wait() else {
-                // C closes the handle and keeps scanning on any open
-                // failure.
-                continue;
-            };
             let Ok(interface) = Self::configure(&device) else {
                 // C closes the handle and keeps scanning on any
                 // configuration/claim failure.

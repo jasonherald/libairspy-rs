@@ -316,9 +316,13 @@ impl Device {
         // Converter resets and drop-counter zeroing from
         // airspy_start_rx happen via fresh queue/converter state here.
         self.set_receiver_mode(ReceiverMode::Off)?;
-        // The bulk-endpoint clear-halt (C ignores its result) now runs
-        // inside run_bulk_stream, right before the transfer pool is
-        // primed.
+        // Clear the bulk-endpoint halt between the receiver-mode OFF and RX
+        // commands, matching airspy_start_rx's order (OFF → clear_halt →
+        // RX → threads) and resetting the host data toggle before the
+        // reader claims the endpoint (issue #75, finding #3). C ignores
+        // clear_halt's result and so do we — a halt-clear failure must not
+        // block a start that would otherwise succeed.
+        let _ = self.usb_handle().clear_halt(BULK_ENDPOINT);
         self.set_receiver_mode(ReceiverMode::Rx)?;
 
         let shared = Arc::new(StreamShared::new(SampleQueue::for_streaming()));
@@ -738,6 +742,72 @@ mod tests {
             );
             device.stop_rx().expect("stop");
         }
+    }
+
+    #[test]
+    fn start_rx_clears_halt_between_receiver_modes() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport, wire};
+
+        // C airspy_start_rx order: receiver OFF -> clear_halt -> receiver
+        // RX -> threads; stop_rx sends OFF. The clear must land BETWEEN the
+        // OFF and RX commands (issue #75, finding #3), not deferred into
+        // the reader.
+        let transport = Arc::new(MockTransport::default());
+        transport.script_bulk(vec![BulkRead::Fill(0x11)]);
+        let mut device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+        device.start_rx(|_| true).expect("start_rx");
+        device.stop_rx().expect("stop");
+
+        let seq: Vec<(u8, u16)> = transport
+            .take_recorded()
+            .into_iter()
+            .filter(|c| c.request == wire::RECEIVER_MODE || c.request == wire::CLEAR_HALT_MARKER)
+            .map(|c| (c.request, c.value))
+            .collect();
+        assert_eq!(
+            seq,
+            vec![
+                (wire::RECEIVER_MODE, wire::RECEIVER_MODE_OFF),
+                (wire::CLEAR_HALT_MARKER, 0),
+                (wire::RECEIVER_MODE, wire::RECEIVER_MODE_RX),
+                (wire::RECEIVER_MODE, wire::RECEIVER_MODE_OFF),
+            ]
+        );
+    }
+
+    #[test]
+    fn persistent_fault_stops_stream() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::MAX_CONSECUTIVE_TRANSFER_ERRORS;
+        use crate::transport::mock::{BulkRead, MockTransport};
+
+        // A single Fault is tolerated (see transient_error_does_not_stop_stream),
+        // but a PERSISTENT storm with no good transfer in between must stop
+        // the reader rather than spin forever (issue #75, finding #5).
+        // Script more consecutive faults than the cap so the stream stops
+        // on its own.
+        let transport = Arc::new(MockTransport::default());
+        let faults: Vec<BulkRead> = (0..(MAX_CONSECUTIVE_TRANSFER_ERRORS + 5))
+            .map(|_| BulkRead::Fail(nusb::transfer::TransferError::Fault))
+            .collect();
+        transport.script_bulk(faults);
+        let mut device = Device::from_transport(transport as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+        device.start_rx(|_| true).expect("start_rx");
+
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(10);
+        while device.is_streaming() && std::time::Instant::now() < deadline {
+            std::thread::sleep(core::time::Duration::from_millis(10));
+        }
+        assert!(
+            !device.is_streaming(),
+            "a persistent fault storm must stop the stream, not spin",
+        );
+        device.stop_rx().expect("stop");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "libairspy-rs"
-version = "0.2.0"
+version = "0.2.1"
 description = "Pure-Rust port of libairspy — Airspy R2/Mini USB driver, no C library required."
 edition.workspace = true
 rust-version.workspace = true

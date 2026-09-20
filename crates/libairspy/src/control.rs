@@ -119,9 +119,16 @@ impl Device {
                 value /= 1000;
             }
         }
-        // C clears the bulk endpoint halt before the request and
-        // ignores the result.
-        let _ = self.usb_handle().clear_halt(BULK_ENDPOINT);
+        // C clears the bulk endpoint halt before the request and ignores
+        // the result. nusb's Endpoint::clear_halt claims the endpoint and
+        // must NOT run while transfers are in flight on it, so we skip the
+        // clear while streaming: a running stream is not halted, and
+        // resetting its host data toggle mid-flight would corrupt it
+        // (issue #75, finding #2). The common case — set the rate before
+        // start_rx — is unaffected. Like C, the clear's result is ignored.
+        if !self.is_streaming() {
+            let _ = self.usb_handle().clear_halt(BULK_ENDPOINT);
+        }
         // C passes the u32 into libusb's u16 wIndex — same truncation.
         #[allow(clippy::cast_possible_truncation)]
         self.in_setter(Command::SetSamplerate, value as u16)
@@ -369,6 +376,15 @@ pub(crate) mod tests {
         assert_eq!(c.timeout, wire::CTRL_TIMEOUT);
     }
 
+    /// `airspy_set_samplerate` clears the bulk-endpoint halt (host-toggle
+    /// reset, issue #75) BEFORE the `SET_SAMPLERATE` control transfer. The
+    /// mock records that clear as a sentinel so its presence and ordering
+    /// are observable.
+    fn assert_clear_halt(c: &crate::transport::mock::ControlCall) {
+        assert_eq!(c.request, wire::CLEAR_HALT_MARKER);
+        assert_eq!(c.index, u16::from(crate::stream::BULK_ENDPOINT));
+    }
+
     #[test]
     fn set_samplerate_by_index_matches_table() {
         let (transport, device) = mock_device();
@@ -376,7 +392,9 @@ pub(crate) mod tests {
         // 2_500_000 is index 1 of the fallback table.
         device.set_samplerate(2_500_000).expect("set");
         let calls = transport.take_recorded();
-        assert_in_setter(&calls[0], wire::SET_SAMPLERATE, 1);
+        // clear_halt first, then the samplerate setter (C order).
+        assert_clear_halt(&calls[0]);
+        assert_in_setter(&calls[1], wire::SET_SAMPLERATE, 1);
     }
 
     #[test]
@@ -386,7 +404,9 @@ pub(crate) mod tests {
         // divides by 1000 (6 MHz -> 12000).
         transport.script_reads(vec![Ok(vec![0u8])]);
         device.set_samplerate(6_000_000).expect("set");
-        assert_in_setter(&transport.take_recorded()[0], wire::SET_SAMPLERATE, 12_000);
+        let calls = transport.take_recorded();
+        assert_clear_halt(&calls[0]);
+        assert_in_setter(&calls[1], wire::SET_SAMPLERATE, 12_000);
 
         // A real (non-IQ) type skips the doubling (6 MHz -> 6000).
         device
@@ -394,7 +414,9 @@ pub(crate) mod tests {
             .expect("type");
         transport.script_reads(vec![Ok(vec![0u8])]);
         device.set_samplerate(6_000_000).expect("set");
-        assert_in_setter(&transport.take_recorded()[0], wire::SET_SAMPLERATE, 6_000);
+        let calls = transport.take_recorded();
+        assert_clear_halt(&calls[0]);
+        assert_in_setter(&calls[1], wire::SET_SAMPLERATE, 6_000);
     }
 
     #[test]
@@ -402,7 +424,9 @@ pub(crate) mod tests {
         let (transport, device) = mock_device();
         transport.script_reads(vec![Ok(vec![0u8])]);
         device.set_samplerate(0).expect("set");
-        assert_in_setter(&transport.take_recorded()[0], wire::SET_SAMPLERATE, 0);
+        let calls = transport.take_recorded();
+        assert_clear_halt(&calls[0]);
+        assert_in_setter(&calls[1], wire::SET_SAMPLERATE, 0);
     }
 
     #[test]

@@ -14,7 +14,7 @@ repository = "https://github.com/jasonherald/libairspy-rs"
 
 [workspace.dependencies]
 # Internal
-libairspy-rs = { path = "crates/libairspy", version = "0.2.0" }
+libairspy-rs = { path = "crates/libairspy", version = "0.2.1" }
 
 # USB + core
 nusb = "0.2.7"
