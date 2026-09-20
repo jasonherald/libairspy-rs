@@ -9,6 +9,25 @@ by crates.io publishes of `libairspy-rs`.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-19
+
+### Changed
+
+- **USB backend migrated from `rusb` (libusb) to `nusb` 0.2** — a pure-Rust,
+  no-C-dependency async USB stack. The streaming reader now keeps a pool of
+  16 bulk transfers in flight (matching the C `airspyone_host` ring) via
+  nusb's `Endpoint` submit / `wait_next_complete` / resubmit loop, replacing
+  the previous single synchronous `read_bulk`. Public API unchanged.
+
+### Fixed
+
+- **Stream starvation and periodic `EIO`/`Fault` under load.** The old
+  single-transfer reader starved the USB pipe between reads, dropping the
+  stream on newer kernels. The 16-in-flight pool keeps the pipe fed, and the
+  reader now tolerates transient bulk-transfer errors (drops the buffer,
+  resubmits, and keeps streaming), stopping only on a genuine device
+  disconnect rather than aborting on the first non-timeout error.
+
 ## [0.1.0] - 2026-08-27
 
 First release: a pure-Rust port of all implemented `airspyone_host`
