@@ -35,9 +35,12 @@ pub enum Error {
     #[error("AIRSPY_ERROR_LIBUSB (-1000): {0}")]
     Usb(#[from] nusb::Error),
     /// `AIRSPY_ERROR_LIBUSB` (-1000), carrying an underlying `nusb`
-    /// transfer error (control or bulk completion). C folds every libusb
-    /// failure into `AIRSPY_ERROR_LIBUSB`; both USB variants keep that
-    /// code/name for reporting parity.
+    /// transfer error from a **control** transfer — the caller-visible
+    /// path. Bulk-completion errors are handled inside the streaming worker
+    /// (dropped and resubmitted, or, when unrecoverable, they stop the
+    /// stream) and are never returned here. C folds every libusb failure
+    /// into `AIRSPY_ERROR_LIBUSB`; both USB variants keep that code/name
+    /// for reporting parity.
     #[error("AIRSPY_ERROR_LIBUSB (-1000): {0}")]
     Transfer(#[from] nusb::transfer::TransferError),
     /// A control transfer moved a different byte count than the

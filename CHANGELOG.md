@@ -24,7 +24,9 @@ backend swap changes the error types carried by `Error`.
   method surface (`open`, `start_rx`, etc.) is unchanged.
 - **BREAKING:** `Error::Usb` now wraps `nusb::Error` (was `rusb::Error`), and
   a new `Error::Transfer(nusb::transfer::TransferError)` variant carries
-  control/bulk transfer failures. Both keep the `AIRSPY_ERROR_LIBUSB (-1000)`
+  control-transfer failures (bulk-completion errors are handled inside the
+  streaming worker — dropped, or stopped on an unrecoverable status — and
+  are not returned to callers). Both keep the `AIRSPY_ERROR_LIBUSB (-1000)`
   code/name. Downstreams that matched on the inner error type must update.
 
 ### Fixed

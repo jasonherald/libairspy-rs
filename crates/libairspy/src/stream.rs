@@ -113,10 +113,19 @@ impl SampleQueue {
     /// primitive: the nusb (and mock) `run_bulk_stream` acquires a free
     /// buffer, copies a completed transfer into it, and pushes it — never
     /// blocking, so a slow consumer causes drops rather than pool
-    /// starvation.
+    /// starvation. On exhaustion the reader drops the transfer's data, so
+    /// we count that here (holding the lock) — otherwise pool-exhaustion
+    /// losses would escape `Transfer::dropped_samples`, which only the
+    /// full-ring path (`push_filled`) would otherwise record.
     pub(crate) fn try_acquire_free(&self) -> Option<Vec<u8>> {
         match self.state.lock() {
-            Ok(mut s) => s.free.pop(),
+            Ok(mut s) => {
+                let buf = s.free.pop();
+                if buf.is_none() {
+                    s.dropped = s.dropped.saturating_add(1);
+                }
+                buf
+            }
             Err(_) => None,
         }
     }
@@ -472,6 +481,30 @@ mod tests {
     }
 
     #[test]
+    fn pool_exhaustion_drop_is_counted() {
+        // Two distinct drop paths must both reach dropped_samples: a full
+        // ring (push_filled) AND an exhausted pool (try_acquire_free ->
+        // None, when the reader can't even acquire a buffer to fill). This
+        // covers the latter.
+        let q = make_queue(); // 3 slots, 4-buffer pool
+        let held: Vec<_> = (0..4)
+            .map(|_| q.try_acquire_free().expect("pool"))
+            .collect();
+        // Pool empty: the reader would drop this transfer's data.
+        assert!(q.try_acquire_free().is_none(), "pool exhausted");
+
+        // Recycle one buffer and queue it: the entry carries the
+        // pool-exhaustion drop accumulated while the pool was empty.
+        let mut held = held;
+        q.recycle(held.pop().expect("held"));
+        let buf = q.acquire_free().expect("recycled");
+        q.push_filled(buf);
+        let (_, dropped) = q.pop_filled().expect("filled");
+        assert_eq!(dropped, 1, "a pool-exhaustion loss must be counted");
+        drop(held);
+    }
+
+    #[test]
     fn pool_is_bounded() {
         let q = make_queue();
         let held: Vec<_> = (0..4)
@@ -639,14 +672,14 @@ mod tests {
         }
         device.stop_rx().expect("stop");
 
-        // Every bulk read used the C endpoint, buffer size, and
-        // timeout.
+        // Every bulk read routed to the C bulk-IN endpoint. (buf_len and
+        // timeout are recorded by the mock from the same BUFFER_SIZE /
+        // EVENT_TIMEOUT constants, so asserting them here would be
+        // self-referential; `constants_match_c` pins their values.)
         let bulk = transport.bulk_calls.lock().expect("mock lock").clone();
         assert!(!bulk.is_empty());
         for call in &bulk {
             assert_eq!(call.endpoint, BULK_ENDPOINT);
-            assert_eq!(call.buf_len, BUFFER_SIZE);
-            assert_eq!(call.timeout, EVENT_TIMEOUT);
         }
     }
 
@@ -672,6 +705,39 @@ mod tests {
         }
         assert!(!device.is_streaming(), "a disconnect must stop the stream");
         device.stop_rx().expect("stop");
+    }
+
+    #[test]
+    fn unrecoverable_error_stops_stream() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+
+        // A halted endpoint (Stall) or a bad argument (InvalidArgument)
+        // fails identically on every resubmit — clear_halt cannot run with
+        // transfers in flight — so retrying would spin the reader with no
+        // samples forever. These must stop the stream (unlike a transient
+        // Fault), letting the caller restart the source.
+        for status in [
+            nusb::transfer::TransferError::Stall,
+            nusb::transfer::TransferError::InvalidArgument,
+        ] {
+            let transport = Arc::new(MockTransport::default());
+            transport.script_bulk(vec![BulkRead::Fail(status)]);
+            let mut device = Device::from_transport(transport as Arc<_>);
+            device.set_sample_type(SampleType::Raw).expect("set type");
+            device.start_rx(|_| true).expect("start_rx");
+
+            let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+            while device.is_streaming() && std::time::Instant::now() < deadline {
+                std::thread::sleep(core::time::Duration::from_millis(10));
+            }
+            assert!(
+                !device.is_streaming(),
+                "{status:?} must stop the stream, not spin",
+            );
+            device.stop_rx().expect("stop");
+        }
     }
 
     #[test]

@@ -223,9 +223,10 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
     // scheduling gap under heavy CPU/GPU load can still fault a single
     // transfer. A robust SDR reader TOLERATES such transient transfer
     // errors — dropping only that buffer's data and resubmitting it —
-    // and stops only when the device actually disconnects. (This is a
-    // deliberate improvement over airspyone_host, which stops on any
-    // non-completed transfer.)
+    // and stops only on a real device disconnect or an unrecoverable
+    // endpoint error (Stall/InvalidArgument). (This is a deliberate
+    // improvement over airspyone_host, which stops on any non-completed
+    // transfer.)
     let mut transient_errors: u64 = 0;
 
     while shared.running() {
@@ -263,8 +264,9 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
 /// Handle one completed bulk transfer: hand a full `BUFFER_SIZE` buffer to
 /// the consumer without blocking (drop-and-count if it's behind) and
 /// resubmit; tolerate transient errors and short transfers (resubmit and
-/// count); stop only on a real device disconnect. Returns `false` when the
-/// stream should stop.
+/// count); stop on a real device disconnect or an unrecoverable endpoint
+/// error (Stall/InvalidArgument). Returns `false` when the stream should
+/// stop.
 fn handle_bulk_completion(
     ep: &mut nusb::Endpoint<Bulk, In>,
     shared: &StreamShared,
@@ -283,16 +285,25 @@ fn handle_bulk_completion(
             ep.submit(c.buffer);
             true
         }
-        // The device is really gone: the only fatal case.
+        // The device is really gone: fatal.
         Err(TransferError::Disconnected) => {
             tracing::warn!("bulk endpoint disconnected; stopping stream");
             false
         }
-        // Everything else — a short transfer, Fault, Stall, Cancelled
-        // (spuriously, while streaming), or an Unknown OS error — is
-        // transient. Drop that buffer's data, do NOT push it, resubmit, and
-        // keep going. (Stall included: clear_halt cannot run with other
-        // transfers in flight, so we resubmit best-effort instead.)
+        // A halted endpoint (Stall) or a bad argument (InvalidArgument)
+        // fails identically on every resubmit — clear_halt cannot run with
+        // other transfers in flight — so retrying would spin the reader
+        // with no samples forever. Stop cleanly and let the caller restart
+        // the source. (Bounding retries of the *transient* errors below
+        // with a consecutive-error cap + backoff is tracked for a
+        // hardware-tested follow-up.)
+        Err(err @ (TransferError::Stall | TransferError::InvalidArgument)) => {
+            tracing::warn!(?err, "unrecoverable bulk transfer error; stopping stream");
+            false
+        }
+        // Everything else — a Fault, a spurious Cancelled while streaming,
+        // or an Unknown OS error — is transient. Drop that buffer's data,
+        // do NOT push it, resubmit, and keep going.
         Err(err) => {
             *transient_errors = transient_errors.saturating_add(1);
             tracing::debug!(?err, "transient bulk transfer error; resubmitting");
@@ -557,9 +568,10 @@ pub(crate) mod mock {
             // Walk the scripted sequence through the same SampleQueue
             // handoff the nusb reader uses: NON-BLOCKING acquire → drop
             // when the consumer is behind (never block, never stall). The
-            // error policy mirrors the production loop: only
-            // `Disconnected` stops; every other error/short transfer is
-            // transient (dropped + kept going).
+            // error policy mirrors the production loop: `Disconnected` and
+            // the unrecoverable endpoint errors (Stall/InvalidArgument)
+            // stop; every other error/short transfer is transient (dropped
+            // + kept going).
             let mut transient_errors: u64 = 0;
             while shared.running() {
                 // Record the simulated transfer's C parameters for the
@@ -570,36 +582,8 @@ pub(crate) mod mock {
                     timeout: EVENT_TIMEOUT,
                 });
                 let next = self.bulk.lock().expect("mock lock").pop_front();
-                match next {
-                    Some(BulkRead::Fill(byte)) => {
-                        if let Some(mut qbuf) = shared.queue.try_acquire_free() {
-                            qbuf.fill(byte);
-                            shared.queue.push_filled(qbuf);
-                        }
-                        // else: consumer behind → drop (queue counts it).
-                    }
-                    // The device is really gone: the only fatal case.
-                    Some(BulkRead::Fail(TransferError::Disconnected)) => {
-                        tracing::warn!("bulk endpoint disconnected; stopping stream");
-                        break;
-                    }
-                    // A short transfer or any non-Disconnected error is
-                    // transient: drop it and keep streaming.
-                    Some(BulkRead::Short(n)) => {
-                        transient_errors = transient_errors.saturating_add(1);
-                        tracing::debug!(
-                            bytes = n,
-                            expected = BUFFER_SIZE,
-                            "transient short bulk transfer; resubmitting"
-                        );
-                    }
-                    Some(BulkRead::Fail(err)) => {
-                        transient_errors = transient_errors.saturating_add(1);
-                        tracing::debug!(?err, "transient bulk transfer error; resubmitting");
-                    }
-                    // Exhausted script: emulate a tolerated client timeout
-                    // (nusb's wait_next_complete → None) and keep going.
-                    None => std::thread::sleep(EXHAUSTED_BULK_POLL),
+                if !handle_mock_bulk(next.as_ref(), shared, &mut transient_errors) {
+                    break;
                 }
             }
             if transient_errors > 0 {
@@ -614,6 +598,60 @@ pub(crate) mod mock {
 
         fn release_interface(&self, _iface: u8) -> Result<()> {
             Ok(())
+        }
+    }
+
+    /// Mirror of the production [`super::handle_bulk_completion`] for the
+    /// scripted mock loop: process one step and return `false` when the
+    /// stream should stop. Keeping the two in lockstep is what lets the
+    /// unit tests assert the real reader's error policy.
+    fn handle_mock_bulk(
+        next: Option<&BulkRead>,
+        shared: &StreamShared,
+        transient_errors: &mut u64,
+    ) -> bool {
+        match next {
+            Some(BulkRead::Fill(byte)) => {
+                if let Some(mut qbuf) = shared.queue.try_acquire_free() {
+                    qbuf.fill(*byte);
+                    shared.queue.push_filled(qbuf);
+                }
+                // else: consumer behind → drop (queue counts it).
+                true
+            }
+            // The device is really gone: fatal.
+            Some(BulkRead::Fail(TransferError::Disconnected)) => {
+                tracing::warn!("bulk endpoint disconnected; stopping stream");
+                false
+            }
+            // Unrecoverable endpoint errors: mirror the production loop and
+            // stop rather than spin on futile resubmits.
+            Some(BulkRead::Fail(err @ (TransferError::Stall | TransferError::InvalidArgument))) => {
+                tracing::warn!(?err, "unrecoverable bulk transfer error; stopping stream");
+                false
+            }
+            // A short transfer or any other non-fatal error is transient:
+            // drop it and keep streaming.
+            Some(BulkRead::Short(n)) => {
+                *transient_errors = transient_errors.saturating_add(1);
+                tracing::debug!(
+                    bytes = n,
+                    expected = BUFFER_SIZE,
+                    "transient short bulk transfer; resubmitting"
+                );
+                true
+            }
+            Some(BulkRead::Fail(err)) => {
+                *transient_errors = transient_errors.saturating_add(1);
+                tracing::debug!(?err, "transient bulk transfer error; resubmitting");
+                true
+            }
+            // Exhausted script: emulate a tolerated client timeout (nusb's
+            // wait_next_complete → None) and keep going.
+            None => {
+                std::thread::sleep(EXHAUSTED_BULK_POLL);
+                true
+            }
         }
     }
 }
