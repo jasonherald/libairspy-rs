@@ -141,6 +141,25 @@ mod tests {
 
     #[test]
     #[ignore = "requires Airspy hardware"]
+    fn discovered_serial_round_trips_through_open_serial() {
+        // Exercises the serial string-descriptor path end to end (issue
+        // #75, finding #1): a failed descriptor read or parse would
+        // silently drop the device from list_devices AND make open_serial
+        // return NotFound. Assert every discovered serial is non-zero and
+        // reopens the device by that serial.
+        let serials = list_devices().expect("list_devices");
+        assert!(!serials.is_empty(), "no Airspy enumerated");
+        for serial in serials {
+            assert_ne!(serial, 0, "serial descriptor read/parsed as zero");
+            println!("reopening discovered serial: 0x{serial:016X}");
+            let device = Device::open_serial(serial)
+                .expect("open_serial with a serial that discovery just read");
+            drop(device);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires Airspy hardware"]
     fn identity_reads_match_an_airspy() {
         let device = Device::open().expect("open");
         let board_id = device.board_id().expect("board_id");

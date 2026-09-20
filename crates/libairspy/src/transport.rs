@@ -615,14 +615,19 @@ pub(crate) mod mock {
         fn clear_halt(&self, endpoint: u8) -> Result<()> {
             // Record the call (as a sentinel ControlCall) so tests can
             // assert it lands between the receiver-mode OFF/RX commands.
-            self.calls.lock().expect("mock lock").push(ControlCall {
-                request_type: 0,
-                request: wire::CLEAR_HALT_MARKER,
-                value: 0,
-                index: u16::from(endpoint),
-                data: Vec::new(),
-                timeout: Duration::ZERO,
-            });
+            // Propagate a poisoned-lock error through the Result rather
+            // than panicking (no expect/unwrap/panic in the crate).
+            self.calls
+                .lock()
+                .map_err(|_| Error::Other)?
+                .push(ControlCall {
+                    request_type: 0,
+                    request: wire::CLEAR_HALT_MARKER,
+                    value: 0,
+                    index: u16::from(endpoint),
+                    data: Vec::new(),
+                    timeout: Duration::ZERO,
+                });
             Ok(())
         }
 

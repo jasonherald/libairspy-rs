@@ -119,9 +119,16 @@ impl Device {
                 value /= 1000;
             }
         }
-        // C clears the bulk endpoint halt before the request and
-        // ignores the result.
-        let _ = self.usb_handle().clear_halt(BULK_ENDPOINT);
+        // C clears the bulk endpoint halt before the request and ignores
+        // the result. nusb's Endpoint::clear_halt claims the endpoint and
+        // must NOT run while transfers are in flight on it, so we skip the
+        // clear while streaming: a running stream is not halted, and
+        // resetting its host data toggle mid-flight would corrupt it
+        // (issue #75, finding #2). The common case — set the rate before
+        // start_rx — is unaffected. Like C, the clear's result is ignored.
+        if !self.is_streaming() {
+            let _ = self.usb_handle().clear_halt(BULK_ENDPOINT);
+        }
         // C passes the u32 into libusb's u16 wIndex — same truncation.
         #[allow(clippy::cast_possible_truncation)]
         self.in_setter(Command::SetSamplerate, value as u16)
