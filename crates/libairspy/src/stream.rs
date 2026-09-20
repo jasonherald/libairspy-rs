@@ -3,17 +3,17 @@
 //! `airspy_is_streaming`, the libusb transfer callback's 8-slot swap
 //! ring, and the producer/consumer thread pair.
 //!
-//! ## Deviation from the C transfer model
+//! ## The transfer pool
 //!
-//! C queues 16 asynchronous 256 KiB URBs and swaps completed buffers
-//! into the ring from libusb's event loop. rusb's safe API exposes
-//! only synchronous bulk reads, so this port uses a dedicated reader
-//! thread issuing back-to-back `read_bulk` calls into recycled
-//! buffers — the same strategy librtlsdr-rs ships. The ring, drop
-//! accounting, and stop semantics are unchanged. Whether one queued
-//! URB sustains 10 MSPS gaplessly is a hardware-validation (M6)
-//! question; if drops appear there, an async-URB upgrade gets its own
-//! issue.
+//! C queues `TRANSFER_COUNT` asynchronous 256 KiB URBs and swaps
+//! completed buffers into the ring from libusb's event loop. The reader
+//! side of that model lives behind the transport
+//! (`UsbTransport::run_bulk_stream`): the nusb backend keeps
+//! `TRANSFER_COUNT` bulk transfers in flight and resubmits each on
+//! completion, handing every full buffer into `SampleQueue`
+//! **non-blocking** (drop-and-count when the consumer is behind) so the
+//! pipe never starves. The ring, drop accounting, and
+//! stop semantics below are shared by the production and mock readers.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,11 @@ pub(crate) const RAW_BUFFER_COUNT: usize = 8;
 /// `device->buffer_size` in `airspy_open_init` (airspy.c) — bytes per
 /// bulk transfer.
 pub(crate) const BUFFER_SIZE: usize = 262_144;
+
+/// `transfer_count` in `airspy_open_init` (airspy.c) — the number of
+/// bulk transfers the reader keeps in flight simultaneously so the USB
+/// pipe never starves between completions.
+pub(crate) const TRANSFER_COUNT: usize = 16;
 
 /// `LIBUSB_ENDPOINT_IN | 1` — the bulk sample endpoint
 /// (`create_io_threads` / `airspy_start_rx` in airspy.c).
@@ -104,20 +109,32 @@ impl SampleQueue {
     }
 
     /// Take a free buffer without blocking. `None` when the pool is
-    /// exhausted (bounded by construction). Test-only: production
-    /// paths use the blocking [`SampleQueue::acquire_free`].
-    #[cfg(test)]
+    /// exhausted (bounded by construction). This is the reader's handoff
+    /// primitive: the nusb (and mock) `run_bulk_stream` acquires a free
+    /// buffer, copies a completed transfer into it, and pushes it — never
+    /// blocking, so a slow consumer causes drops rather than pool
+    /// starvation. On exhaustion the reader drops the transfer's data, so
+    /// we count that here (holding the lock) — otherwise pool-exhaustion
+    /// losses would escape `Transfer::dropped_samples`, which only the
+    /// full-ring path (`push_filled`) would otherwise record.
     pub(crate) fn try_acquire_free(&self) -> Option<Vec<u8>> {
         match self.state.lock() {
-            Ok(mut s) => s.free.pop(),
+            Ok(mut s) => {
+                let buf = s.free.pop();
+                if buf.is_none() {
+                    s.dropped = s.dropped.saturating_add(1);
+                }
+                buf
+            }
             Err(_) => None,
         }
     }
 
     /// Take a free buffer, blocking until one is recycled or the queue
-    /// shuts down (`None`). Replaces a busy-wait in the reader: with
-    /// the sync read model, an exhausted pool means the consumer holds
-    /// every buffer, and the reader must sleep rather than spin.
+    /// shuts down (`None`). Retained for the queue's own unit tests; the
+    /// streaming readers use the non-blocking
+    /// [`SampleQueue::try_acquire_free`].
+    #[cfg(test)]
     pub(crate) fn acquire_free(&self) -> Option<Vec<u8>> {
         let mut s = self.state.lock().ok()?;
         loop {
@@ -255,53 +272,6 @@ pub(crate) fn run_consumer(
     shared.streaming.store(false, Ordering::SeqCst);
 }
 
-/// The reader half — C's transfer thread plus libusb callback,
-/// collapsed into a synchronous `read_bulk` loop (see the module
-/// docs).
-fn run_reader(shared: &StreamShared, handle: &dyn crate::transport::UsbTransport) {
-    while shared.running() {
-        // Blocks until the consumer recycles a buffer or stop shuts
-        // the queue down. While blocked no reads are issued, so USB
-        // data lost in that window is uncounted — unlike C, whose
-        // still-completing transfers increment dropped_buffers; see
-        // the module docs on the sync-read deviation.
-        let Some(mut buf) = shared.queue.acquire_free() else {
-            break;
-        };
-        // A stop that raced the acquisition wins: no further reads.
-        if !shared.running() {
-            shared.queue.recycle(buf);
-            break;
-        }
-        match handle.read_bulk(BULK_ENDPOINT, &mut buf, EVENT_TIMEOUT) {
-            // C requires actual_length == length; a short transfer
-            // stops streaming.
-            Ok(n) if n == BUFFER_SIZE => shared.queue.push_filled(buf),
-            Err(rusb::Error::Timeout | rusb::Error::Interrupted) => {
-                // The C event loop tolerates timeouts/EINTR and keeps
-                // polling while streaming.
-                shared.queue.recycle(buf);
-            }
-            Ok(n) => {
-                tracing::warn!(
-                    bytes = n,
-                    expected = BUFFER_SIZE,
-                    "short bulk transfer; stopping stream"
-                );
-                shared.queue.recycle(buf);
-                shared.streaming.store(false, Ordering::SeqCst);
-            }
-            Err(err) => {
-                tracing::warn!(%err, "bulk read failed; stopping stream");
-                shared.queue.recycle(buf);
-                shared.streaming.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-    shared.streaming.store(false, Ordering::SeqCst);
-    shared.queue.shutdown();
-}
-
 /// Worker-thread handles held by a streaming [`Device`].
 pub(crate) struct StreamWorkers {
     pub(crate) shared: Arc<StreamShared>,
@@ -346,8 +316,9 @@ impl Device {
         // Converter resets and drop-counter zeroing from
         // airspy_start_rx happen via fresh queue/converter state here.
         self.set_receiver_mode(ReceiverMode::Off)?;
-        // C ignores the clear-halt result.
-        let _ = self.usb_handle().clear_halt(BULK_ENDPOINT);
+        // The bulk-endpoint clear-halt (C ignores its result) now runs
+        // inside run_bulk_stream, right before the transfer pool is
+        // primed.
         self.set_receiver_mode(ReceiverMode::Rx)?;
 
         let shared = Arc::new(StreamShared::new(SampleQueue::for_streaming()));
@@ -371,7 +342,7 @@ impl Device {
         let reader_handle = self.usb_handle_arc();
         let spawn_result = std::thread::Builder::new()
             .name("airspy-reader".into())
-            .spawn(move || run_reader(&reader_shared, reader_handle.as_ref()));
+            .spawn(move || reader_handle.run_bulk_stream(BULK_ENDPOINT, &reader_shared));
         let Ok(reader) = spawn_result else {
             // Don't orphan the already-running consumer, and switch
             // the receiver off (same hardening as above).
@@ -457,6 +428,7 @@ mod tests {
         // bulk endpoint (LIBUSB_ENDPOINT_IN | 1) from airspy.c.
         assert_eq!(RAW_BUFFER_COUNT, 8);
         assert_eq!(BUFFER_SIZE, 262_144);
+        assert_eq!(TRANSFER_COUNT, 16);
         assert_eq!(BULK_ENDPOINT, 0x81);
         assert_eq!(EVENT_TIMEOUT, core::time::Duration::from_millis(500));
     }
@@ -506,6 +478,30 @@ mod tests {
         assert_eq!(d1, 0); // third slot
         let (_, d2) = q.pop_filled().expect("filled");
         assert_eq!(d2, 1); // the post-drop push carries the count
+    }
+
+    #[test]
+    fn pool_exhaustion_drop_is_counted() {
+        // Two distinct drop paths must both reach dropped_samples: a full
+        // ring (push_filled) AND an exhausted pool (try_acquire_free ->
+        // None, when the reader can't even acquire a buffer to fill). This
+        // covers the latter.
+        let q = make_queue(); // 3 slots, 4-buffer pool
+        let held: Vec<_> = (0..4)
+            .map(|_| q.try_acquire_free().expect("pool"))
+            .collect();
+        // Pool empty: the reader would drop this transfer's data.
+        assert!(q.try_acquire_free().is_none(), "pool exhausted");
+
+        // Recycle one buffer and queue it: the entry carries the
+        // pool-exhaustion drop accumulated while the pool was empty.
+        let mut held = held;
+        q.recycle(held.pop().expect("held"));
+        let buf = q.acquire_free().expect("recycled");
+        q.push_filled(buf);
+        let (_, dropped) = q.pop_filled().expect("filled");
+        assert_eq!(dropped, 1, "a pool-exhaustion loss must be counted");
+        drop(held);
     }
 
     #[test]
@@ -676,25 +672,29 @@ mod tests {
         }
         device.stop_rx().expect("stop");
 
-        // Every bulk read used the C endpoint, buffer size, and
-        // timeout.
+        // Every bulk read routed to the C bulk-IN endpoint. (buf_len and
+        // timeout are recorded by the mock from the same BUFFER_SIZE /
+        // EVENT_TIMEOUT constants, so asserting them here would be
+        // self-referential; `constants_match_c` pins their values.)
         let bulk = transport.bulk_calls.lock().expect("mock lock").clone();
         assert!(!bulk.is_empty());
         for call in &bulk {
             assert_eq!(call.endpoint, BULK_ENDPOINT);
-            assert_eq!(call.buf_len, BUFFER_SIZE);
-            assert_eq!(call.timeout, EVENT_TIMEOUT);
         }
     }
 
     #[test]
-    fn bulk_error_stops_stream() {
+    fn disconnect_stops_stream() {
         use crate::commands::SampleType;
         use crate::device::Device;
         use crate::transport::mock::{BulkRead, MockTransport};
 
+        // Disconnected is the ONLY fatal transfer error: the device is
+        // really gone, so the stream must stop.
         let transport = Arc::new(MockTransport::default());
-        transport.script_bulk(vec![BulkRead::Fail(rusb::Error::Pipe)]);
+        transport.script_bulk(vec![BulkRead::Fail(
+            nusb::transfer::TransferError::Disconnected,
+        )]);
         let mut device = Device::from_transport(transport as Arc<_>);
         device.set_sample_type(SampleType::Raw).expect("set type");
         device.start_rx(|_| true).expect("start_rx");
@@ -703,12 +703,139 @@ mod tests {
         while device.is_streaming() && std::time::Instant::now() < deadline {
             std::thread::sleep(core::time::Duration::from_millis(10));
         }
-        assert!(!device.is_streaming(), "bulk error must stop the stream");
+        assert!(!device.is_streaming(), "a disconnect must stop the stream");
         device.stop_rx().expect("stop");
     }
 
     #[test]
-    fn short_bulk_read_stops_stream_without_delivery() {
+    fn unrecoverable_error_stops_stream() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+
+        // A halted endpoint (Stall) or a bad argument (InvalidArgument)
+        // fails identically on every resubmit — clear_halt cannot run with
+        // transfers in flight — so retrying would spin the reader with no
+        // samples forever. These must stop the stream (unlike a transient
+        // Fault), letting the caller restart the source.
+        for status in [
+            nusb::transfer::TransferError::Stall,
+            nusb::transfer::TransferError::InvalidArgument,
+        ] {
+            let transport = Arc::new(MockTransport::default());
+            transport.script_bulk(vec![BulkRead::Fail(status)]);
+            let mut device = Device::from_transport(transport as Arc<_>);
+            device.set_sample_type(SampleType::Raw).expect("set type");
+            device.start_rx(|_| true).expect("start_rx");
+
+            let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+            while device.is_streaming() && std::time::Instant::now() < deadline {
+                std::thread::sleep(core::time::Duration::from_millis(10));
+            }
+            assert!(
+                !device.is_streaming(),
+                "{status:?} must stop the stream, not spin",
+            );
+            device.stop_rx().expect("stop");
+        }
+    }
+
+    #[test]
+    fn transient_error_does_not_stop_stream() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+        use std::sync::mpsc;
+
+        // A transient Fault (the ~28s-under-load case from real
+        // hardware) must NOT kill the stream: the faulted buffer is
+        // dropped, and subsequent transfers keep delivering.
+        let transport = Arc::new(MockTransport::default());
+        transport.script_bulk(vec![
+            BulkRead::Fail(nusb::transfer::TransferError::Fault),
+            BulkRead::Fill(0xAB),
+            BulkRead::Fill(0xCD),
+        ]);
+        let mut device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+
+        let (tx, rx) = mpsc::channel();
+        device
+            .start_rx(move |transfer| {
+                let Samples::Raw(bytes) = transfer.samples else {
+                    unreachable!("RAW stream");
+                };
+                tx.send(bytes[0]).is_ok()
+            })
+            .expect("start_rx");
+
+        // The fault is dropped (no delivery); the two fills after it
+        // still arrive, proving the stream tolerated the error.
+        for expected in [0xAB, 0xCD] {
+            let first = rx
+                .recv_timeout(core::time::Duration::from_secs(5))
+                .expect("delivery after a tolerated transient error");
+            assert_eq!(first, expected);
+        }
+        assert!(
+            device.is_streaming(),
+            "a transient transfer error must not stop the stream"
+        );
+        device.stop_rx().expect("stop");
+        assert!(!device.is_streaming());
+    }
+
+    #[test]
+    fn slow_consumer_drops_without_stopping_the_stream() {
+        // The whole point of the transfer pool: a consumer that can't
+        // keep up must cause DROPS, never a blocked reader or a stopped
+        // stream. Drive a burst of full buffers through the mock stream
+        // against a deliberately slow consumer and prove the stream
+        // keeps delivering and stays alive under the backpressure.
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+        use std::sync::mpsc;
+
+        let transport = Arc::new(MockTransport::default());
+        // Far more full buffers than the SampleQueue pool can hold at
+        // once, so try_acquire_free must return None (→ drop) for many.
+        let fills: Vec<BulkRead> = (0..40).map(|_| BulkRead::Fill(0x5A)).collect();
+        transport.script_bulk(fills);
+        let mut device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        device.set_sample_type(SampleType::Raw).expect("set type");
+
+        let (tx, rx) = mpsc::channel();
+        device
+            .start_rx(move |transfer| {
+                // Hold each buffer long enough that the producer outruns
+                // the consumer and the queue backs up.
+                std::thread::sleep(core::time::Duration::from_millis(5));
+                let Samples::Raw(bytes) = transfer.samples else {
+                    unreachable!("RAW stream");
+                };
+                tx.send(bytes.len()).is_ok()
+            })
+            .expect("start_rx");
+
+        // Deliveries must keep arriving (a stopped stream would drop the
+        // sender and end recv); receive several under backpressure.
+        for _ in 0..3 {
+            let len = rx
+                .recv_timeout(core::time::Duration::from_secs(5))
+                .expect("delivery under backpressure");
+            assert_eq!(len, BUFFER_SIZE);
+        }
+        assert!(
+            device.is_streaming(),
+            "backpressure must drop buffers, never stop the stream"
+        );
+        device.stop_rx().expect("stop");
+        assert!(!device.is_streaming());
+    }
+
+    #[test]
+    fn short_bulk_read_delivers_nothing_but_keeps_streaming() {
         use crate::commands::SampleType;
         use crate::device::Device;
         use crate::transport::mock::{BulkRead, MockTransport};
@@ -724,18 +851,19 @@ mod tests {
             .start_rx(move |_| tx.send(()).is_ok())
             .expect("start_rx");
 
-        // C requires actual_length == length: the short read delivers
-        // nothing and terminates the stream.
+        // A short transfer (actual_length != length) delivers nothing,
+        // but is now treated as transient — the stream stays alive
+        // instead of stopping.
         assert!(
             rx.recv_timeout(core::time::Duration::from_millis(500))
                 .is_err(),
             "no callback for a short transfer"
         );
-        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
-        while device.is_streaming() && std::time::Instant::now() < deadline {
-            std::thread::sleep(core::time::Duration::from_millis(10));
-        }
-        assert!(!device.is_streaming());
+        assert!(
+            device.is_streaming(),
+            "a short transfer must not stop the stream"
+        );
         device.stop_rx().expect("stop");
+        assert!(!device.is_streaming());
     }
 }

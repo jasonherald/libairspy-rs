@@ -38,7 +38,7 @@ pub(crate) const VENDOR_IN_REQUEST_TYPE: u8 = 0xC0;
 
 impl Device {
     /// Host-to-device vendor request. Returns the number of bytes
-    /// transferred; rusb/libusb errors map to `Error::Usb` (C's
+    /// transferred; nusb transfer errors map to `Error::Transfer` (C's
     /// `AIRSPY_ERROR_LIBUSB`).
     pub(crate) fn vendor_out(
         &self,
@@ -47,14 +47,14 @@ impl Device {
         index: u16,
         data: &[u8],
     ) -> Result<usize> {
-        Ok(self.usb_handle().write_control(
+        self.usb_handle().write_control(
             VENDOR_OUT_REQUEST_TYPE,
             command as u8,
             value,
             index,
             data,
             CTRL_TIMEOUT,
-        )?)
+        )
     }
 
     /// Device-to-host vendor request. Returns the number of bytes
@@ -66,14 +66,14 @@ impl Device {
         index: u16,
         data: &mut [u8],
     ) -> Result<usize> {
-        Ok(self.usb_handle().read_control(
+        self.usb_handle().read_control(
             VENDOR_IN_REQUEST_TYPE,
             command as u8,
             value,
             index,
             data,
             CTRL_TIMEOUT,
-        )?)
+        )
     }
 }
 
@@ -84,24 +84,10 @@ mod tests {
     #[test]
     fn request_types_match_c_libusb_flags() {
         // Every control transfer in airspy.c uses one of these two
-        // bmRequestType bytes; rusb::request_type is the ground truth
-        // for the same libusb flag composition.
-        assert_eq!(
-            VENDOR_OUT_REQUEST_TYPE,
-            rusb::request_type(
-                rusb::Direction::Out,
-                rusb::RequestType::Vendor,
-                rusb::Recipient::Device
-            )
-        );
-        assert_eq!(
-            VENDOR_IN_REQUEST_TYPE,
-            rusb::request_type(
-                rusb::Direction::In,
-                rusb::RequestType::Vendor,
-                rusb::Recipient::Device
-            )
-        );
+        // bmRequestType bytes: OUT|VENDOR|DEVICE (0x00|0x40|0x00) and
+        // IN|VENDOR|DEVICE (0x80|0x40|0x00). The production transport
+        // maps them to nusb's ControlType::Vendor + Recipient::Device
+        // (direction implied by control_out vs control_in).
         assert_eq!(VENDOR_OUT_REQUEST_TYPE, 0x40);
         assert_eq!(VENDOR_IN_REQUEST_TYPE, 0xC0);
     }

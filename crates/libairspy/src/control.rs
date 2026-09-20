@@ -285,9 +285,12 @@ pub(crate) mod tests {
     #[test]
     fn set_freq_usb_error_passes_through() {
         let (transport, device) = mock_device();
-        transport.script_writes(vec![Err(rusb::Error::Pipe)]);
+        transport.script_writes(vec![Err(nusb::transfer::TransferError::Stall)]);
         let err = device.set_freq(1).expect_err("usb error");
-        assert!(matches!(err, crate::Error::Usb(rusb::Error::Pipe)));
+        assert!(matches!(
+            err,
+            crate::Error::Transfer(nusb::transfer::TransferError::Stall)
+        ));
     }
 
     #[test]
