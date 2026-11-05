@@ -31,8 +31,24 @@ use crate::transfer::NO_WINDEX;
 pub(crate) const RAW_BUFFER_COUNT: usize = 8;
 
 /// `device->buffer_size` in `airspy_open_init` (airspy.c) — bytes per
-/// bulk transfer.
+/// bulk transfer, for the unpacked (default) geometry.
 pub(crate) const BUFFER_SIZE: usize = 262_144;
+
+/// `device->buffer_size` while packing is enabled — `6144 * 24`
+/// (`airspy_set_packing`, airspy.c) — the smaller geometry the 12-bit
+/// packed stream uses.
+pub(crate) const PACKED_BUFFER_SIZE: usize = 6144 * 24;
+
+/// The bulk-transfer byte size for a stream's packing mode: unpacked
+/// transfers carry [`BUFFER_SIZE`] bytes of 16-bit words, packed
+/// transfers carry [`PACKED_BUFFER_SIZE`] bytes of 12-bit words.
+fn buffer_size_for(packing_enabled: bool) -> usize {
+    if packing_enabled {
+        PACKED_BUFFER_SIZE
+    } else {
+        BUFFER_SIZE
+    }
+}
 
 /// `transfer_count` in `airspy_open_init` (airspy.c) — the number of
 /// bulk transfers the reader keeps in flight simultaneously so the USB
@@ -89,11 +105,11 @@ struct QueueState {
 impl SampleQueue {
     /// A queue with `slots` ring positions and a pool of `pool`
     /// preallocated buffers.
-    pub(crate) fn with_pool(slots: usize, pool: usize) -> Self {
+    pub(crate) fn with_pool(slots: usize, pool: usize, buffer_size: usize) -> Self {
         Self {
             state: Mutex::new(QueueState {
                 filled: VecDeque::with_capacity(slots),
-                free: (0..pool).map(|_| vec![0u8; BUFFER_SIZE]).collect(),
+                free: (0..pool).map(|_| vec![0u8; buffer_size]).collect(),
                 dropped: 0,
                 shutdown: false,
             }),
@@ -103,9 +119,14 @@ impl SampleQueue {
     }
 
     /// The production configuration: `RAW_BUFFER_COUNT` slots plus one
-    /// extra buffer so the producer always has one in flight.
-    pub(crate) fn for_streaming() -> Self {
-        Self::with_pool(RAW_BUFFER_COUNT, RAW_BUFFER_COUNT + 1)
+    /// extra buffer so the producer always has one in flight, at the
+    /// buffer size the current packing mode calls for.
+    pub(crate) fn for_streaming(packing_enabled: bool) -> Self {
+        Self::with_pool(
+            RAW_BUFFER_COUNT,
+            RAW_BUFFER_COUNT + 1,
+            buffer_size_for(packing_enabled),
+        )
     }
 
     /// Take a free buffer without blocking. `None` when the pool is
@@ -221,6 +242,8 @@ pub(crate) struct StreamShared {
 }
 
 impl StreamShared {
+    /// Create the streaming state: a live flag plus a fresh sample
+    /// queue, over the reader's [`SampleQueue`].
     pub(crate) fn new(queue: SampleQueue) -> Self {
         Self {
             streaming: AtomicBool::new(false),
@@ -229,6 +252,8 @@ impl StreamShared {
         }
     }
 
+    /// True while the stream is live — `streaming` latched on and no
+    /// stop requested (`airspy_is_streaming`).
     pub(crate) fn running(&self) -> bool {
         self.streaming.load(Ordering::SeqCst) && !self.stop_requested.load(Ordering::SeqCst)
     }
@@ -244,7 +269,11 @@ pub(crate) fn run_consumer(
     callback: &mut (impl FnMut(Transfer<'_>) -> bool + ?Sized),
 ) {
     // Preallocated so the hot loop never grows a buffer.
-    let mut scratch = Scratch::for_stream(sample_type, packing_enabled, BUFFER_SIZE);
+    let mut scratch = Scratch::for_stream(
+        sample_type,
+        packing_enabled,
+        buffer_size_for(packing_enabled),
+    );
     while shared.running() {
         let Some((buf, dropped)) = shared.queue.pop_filled() else {
             break;
@@ -325,7 +354,9 @@ impl Device {
         let _ = self.usb_handle().clear_halt(BULK_ENDPOINT);
         self.set_receiver_mode(ReceiverMode::Rx)?;
 
-        let shared = Arc::new(StreamShared::new(SampleQueue::for_streaming()));
+        let shared = Arc::new(StreamShared::new(SampleQueue::for_streaming(
+            packing_enabled,
+        )));
         shared.streaming.store(true, Ordering::SeqCst);
 
         let consumer_shared = Arc::clone(&shared);
@@ -344,9 +375,12 @@ impl Device {
 
         let reader_shared = Arc::clone(&shared);
         let reader_handle = self.usb_handle_arc();
+        let buffer_size = buffer_size_for(packing_enabled);
         let spawn_result = std::thread::Builder::new()
             .name("airspy-reader".into())
-            .spawn(move || reader_handle.run_bulk_stream(BULK_ENDPOINT, &reader_shared));
+            .spawn(move || {
+                reader_handle.run_bulk_stream(BULK_ENDPOINT, &reader_shared, buffer_size);
+            });
         let Ok(reader) = spawn_result else {
             // Don't orphan the already-running consumer, and switch
             // the receiver off (same hardening as above).
@@ -435,10 +469,36 @@ mod tests {
         assert_eq!(TRANSFER_COUNT, 16);
         assert_eq!(BULK_ENDPOINT, 0x81);
         assert_eq!(EVENT_TIMEOUT, core::time::Duration::from_millis(500));
+        // device->buffer_size while packing is enabled (airspy_set_packing).
+        assert_eq!(PACKED_BUFFER_SIZE, 6144 * 24);
     }
 
     fn make_queue() -> SampleQueue {
-        SampleQueue::with_pool(3, 4) // 3 slots, 4-buffer pool, tiny for tests
+        SampleQueue::with_pool(3, 4, BUFFER_SIZE) // 3 slots, 4-buffer pool, tiny for tests
+    }
+
+    /// Phase 1: the production queue must size its pool from the
+    /// packing mode — packed transfers get the 6144*24-byte geometry,
+    /// unpacked get the 256 KiB one — the same reassignment
+    /// `airspy_set_packing` makes to `device->buffer_size` (airspy.c).
+    #[test]
+    fn streaming_queue_sizes_buffers_from_packing_mode() {
+        let packed = SampleQueue::for_streaming(true);
+        {
+            let s = packed.state.lock().expect("queue lock");
+            assert_eq!(s.free.len(), RAW_BUFFER_COUNT + 1);
+            for buf in &s.free {
+                assert_eq!(buf.len(), PACKED_BUFFER_SIZE);
+            }
+        }
+        let unpacked = SampleQueue::for_streaming(false);
+        {
+            let s = unpacked.state.lock().expect("queue lock");
+            assert_eq!(s.free.len(), RAW_BUFFER_COUNT + 1);
+            for buf in &s.free {
+                assert_eq!(buf.len(), BUFFER_SIZE);
+            }
+        }
     }
 
     #[test]
@@ -561,7 +621,7 @@ mod tests {
         // a Transfer with the accumulated dropped-sample count, and a
         // callback returning false clears `streaming` (C: nonzero
         // return → device->streaming = false).
-        let shared = Arc::new(StreamShared::new(SampleQueue::with_pool(3, 4)));
+        let shared = Arc::new(StreamShared::new(SampleQueue::with_pool(3, 4, BUFFER_SIZE)));
         shared.streaming.store(true, Ordering::SeqCst);
 
         for fill in [1u8, 2, 3] {
@@ -638,6 +698,15 @@ mod tests {
         device.stop_rx().expect("stop");
         assert!(!device.is_streaming());
 
+        // The unpacked end-to-end stream must record the unpacked
+        // transfer geometry for every delivery.
+        let bulk = transport.bulk_calls.lock().expect("mock lock").clone();
+        assert!(!bulk.is_empty());
+        for call in &bulk {
+            assert_eq!(call.endpoint, BULK_ENDPOINT);
+            assert_eq!(call.buf_len, BUFFER_SIZE);
+        }
+
         let modes: Vec<(u8, u16)> = transport
             .take_recorded()
             .into_iter()
@@ -684,6 +753,62 @@ mod tests {
         assert!(!bulk.is_empty());
         for call in &bulk {
             assert_eq!(call.endpoint, BULK_ENDPOINT);
+        }
+    }
+
+    /// Phase 1: after `set_packing(true)` + `start_rx` the reader's bulk
+    /// transfers must carry the packed geometry (6144*24), not the
+    /// unpacked 256 KiB buffer — and deliveries must come back at that
+    /// size too.
+    #[test]
+    fn packed_stream_uses_packed_buffer_size() {
+        use crate::commands::SampleType;
+        use crate::device::Device;
+        use crate::transport::mock::{BulkRead, MockTransport};
+        use std::sync::mpsc;
+        let transport = Arc::new(MockTransport::default());
+        transport.script_bulk(vec![BulkRead::Fill(0x33)]);
+        let mut device = Device::from_transport(Arc::clone(&transport) as Arc<_>);
+        // Drain the open-time samplerate-query traffic before
+        // scripting the IN-with-status status byte set_packing needs.
+        transport.take_recorded();
+        transport.script_reads(vec![Ok(vec![0u8])]); // IN-with-status status byte
+        device.set_sample_type(SampleType::Raw).expect("set type");
+        device.set_packing(true).expect("packing");
+        let (tx, rx) = mpsc::channel();
+        device
+            .start_rx(move |transfer| {
+                let Samples::Raw(bytes) = transfer.samples else {
+                    unreachable!("RAW stream delivers raw bytes");
+                };
+                tx.send((bytes[0], bytes.len(), transfer.dropped_samples))
+                    .is_ok()
+            })
+            .expect("start_rx");
+
+        // The three scripted buffers arrive in order, full-sized.
+        let (first, len, dropped) = rx
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .expect("block");
+        assert_eq!(first, 0x33);
+        assert_eq!(len, PACKED_BUFFER_SIZE);
+        assert_eq!(dropped, 0);
+
+        // Wait (bounded) for the reader's first bulk call so an
+        // instant stop can't win the race.
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        while transport.bulk_calls.lock().expect("mock lock").is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(core::time::Duration::from_millis(5));
+        }
+        device.stop_rx().expect("stop");
+
+        let bulk = transport.bulk_calls.lock().expect("mock lock").clone();
+        assert!(!bulk.is_empty());
+        for call in &bulk {
+            assert_eq!(call.endpoint, BULK_ENDPOINT);
+            assert_eq!(call.buf_len, PACKED_BUFFER_SIZE);
         }
     }
 

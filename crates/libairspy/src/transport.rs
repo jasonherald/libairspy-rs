@@ -23,7 +23,7 @@ use nusb::MaybeFuture as _;
 use nusb::transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Recipient, TransferError};
 
 use crate::error::Result;
-use crate::stream::{BUFFER_SIZE, EVENT_TIMEOUT, StreamShared, TRANSFER_COUNT};
+use crate::stream::{EVENT_TIMEOUT, StreamShared, TRANSFER_COUNT};
 
 /// Stop the stream after this many consecutive non-fatal transfer errors
 /// with no successful transfer in between. A single transient fault still
@@ -75,9 +75,9 @@ pub(crate) trait UsbTransport: Send + Sync + std::fmt::Debug {
 
     /// Run the whole bulk-streaming loop until `!shared.running()`,
     /// keeping [`TRANSFER_COUNT`] transfers in flight and pushing each
-    /// completed [`BUFFER_SIZE`]-byte buffer into `shared.queue`. On
+    /// completed `buffer_size`-byte buffer into `shared.queue`. On
     /// return, `streaming` is cleared and the queue is shut down.
-    fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared);
+    fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared, buffer_size: usize);
 
     /// `libusb_release_interface` (the close half of `airspy_open_exit`).
     /// nusb releases a claimed interface when the `Interface` drops, so
@@ -94,18 +94,23 @@ pub(crate) struct NusbTransport {
 }
 
 impl NusbTransport {
+    /// Wrap a claimed `nusb::Interface` in the production transport.
     pub(crate) fn new(interface: nusb::Interface) -> Self {
         Self { interface }
     }
 }
 
 impl std::fmt::Debug for NusbTransport {
+    /// Stable, address-free debug output (the `nusb::Interface` Debug
+    /// would print internal pointers).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NusbTransport").finish_non_exhaustive()
     }
 }
 
 impl UsbTransport for NusbTransport {
+    /// `libusb_control_transfer`, host-to-device. Returns the number of
+    /// bytes accepted by the device.
     fn write_control(
         &self,
         _request_type: u8,
@@ -136,6 +141,8 @@ impl UsbTransport for NusbTransport {
         Ok(buf.len())
     }
 
+    /// `libusb_control_transfer`, device-to-host. Returns the number of
+    /// bytes read into `buf`.
     fn read_control(
         &self,
         _request_type: u8,
@@ -182,8 +189,8 @@ impl UsbTransport for NusbTransport {
         Ok(())
     }
 
-    fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared) {
-        run_bulk_stream_impl(&self.interface, endpoint, shared);
+    fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared, buffer_size: usize) {
+        run_bulk_stream_impl(&self.interface, endpoint, shared, buffer_size);
     }
 
     fn release_interface(&self, _iface: u8) -> Result<()> {
@@ -241,9 +248,14 @@ fn resubmit_or_stop(
 
 /// The nusb transfer-pool reader — `airspy.c`'s `transfer_threadproc` +
 /// `airspy_libusb_transfer_callback`, keeping [`TRANSFER_COUNT`]
-/// 262144-byte bulk transfers in flight and resubmitting each on
-/// completion so the pipe never starves.
-fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &StreamShared) {
+/// transfers in flight (sized by the caller from the packing mode) and
+/// resubmitting each on completion so the pipe never starves.
+fn run_bulk_stream_impl(
+    interface: &nusb::Interface,
+    endpoint: u8,
+    shared: &StreamShared,
+    buffer_size: usize,
+) {
     // Open the bulk-IN endpoint. A failure here can't stream anything,
     // so clear streaming and shut the queue down before returning.
     let mut ep = match interface.endpoint::<Bulk, In>(endpoint) {
@@ -265,7 +277,7 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
     // Prime the pool: TRANSFER_COUNT outstanding transfers, as in
     // airspy.c's create_transfers loop.
     for _ in 0..TRANSFER_COUNT {
-        let buf = ep.allocate(BUFFER_SIZE);
+        let buf = ep.allocate(buffer_size);
         ep.submit(buf);
     }
 
@@ -285,7 +297,7 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
         let Some(c) = ep.wait_next_complete(EVENT_TIMEOUT) else {
             continue;
         };
-        if !handle_bulk_completion(&mut ep, shared, c, &mut run) {
+        if !handle_bulk_completion(&mut ep, shared, c, &mut run, buffer_size) {
             break;
         }
     }
@@ -311,7 +323,7 @@ fn run_bulk_stream_impl(interface: &nusb::Interface, endpoint: u8, shared: &Stre
     shared.queue.shutdown();
 }
 
-/// Handle one completed bulk transfer: hand a full `BUFFER_SIZE` buffer to
+/// Handle one completed bulk transfer: hand a full `buffer_size` buffer to
 /// the consumer without blocking (drop-and-count if it's behind) and
 /// resubmit; tolerate transient errors and short transfers (resubmit and
 /// count); stop on a real device disconnect or an unrecoverable endpoint
@@ -322,13 +334,14 @@ fn handle_bulk_completion(
     shared: &StreamShared,
     c: nusb::transfer::Completion,
     run: &mut ErrorRun,
+    buffer_size: usize,
 ) -> bool {
     match c.status {
-        // A complete BUFFER_SIZE transfer: hand it to the consumer WITHOUT
+        // A complete `buffer_size` transfer: hand it to the consumer WITHOUT
         // blocking — if the consumer is behind, drop it (SampleQueue counts
         // the drop) rather than stall the pool. Then resubmit the buffer.
         // A good transfer clears the consecutive-error run.
-        Ok(()) if c.buffer.len() == BUFFER_SIZE => {
+        Ok(()) if c.buffer.len() == buffer_size => {
             run.consecutive = 0;
             if let Some(mut qbuf) = shared.queue.try_acquire_free() {
                 qbuf.copy_from_slice(&c.buffer[..]);
@@ -362,7 +375,7 @@ fn handle_bulk_completion(
         Ok(()) => {
             tracing::debug!(
                 bytes = c.buffer.len(),
-                expected = BUFFER_SIZE,
+                expected = buffer_size,
                 "transient short bulk transfer; resubmitting"
             );
             resubmit_or_stop(ep, c.buffer, run)
@@ -374,7 +387,7 @@ fn handle_bulk_completion(
 pub(crate) mod mock {
     use super::UsbTransport;
     use crate::error::{Error, Result};
-    use crate::stream::{BUFFER_SIZE, EVENT_TIMEOUT, StreamShared};
+    use crate::stream::{EVENT_TIMEOUT, StreamShared};
     use nusb::transfer::TransferError;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -631,7 +644,7 @@ pub(crate) mod mock {
             Ok(())
         }
 
-        fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared) {
+        fn run_bulk_stream(&self, endpoint: u8, shared: &StreamShared, buffer_size: usize) {
             // Walk the scripted sequence through the same SampleQueue
             // handoff the nusb reader uses: NON-BLOCKING acquire → drop
             // when the consumer is behind (never block, never stall). The
@@ -645,11 +658,11 @@ pub(crate) mod mock {
                 // wire-contract test.
                 self.bulk_calls.lock().expect("mock lock").push(BulkCall {
                     endpoint,
-                    buf_len: BUFFER_SIZE,
+                    buf_len: buffer_size,
                     timeout: EVENT_TIMEOUT,
                 });
                 let next = self.bulk.lock().expect("mock lock").pop_front();
-                if !handle_mock_bulk(next.as_ref(), shared, &mut run) {
+                if !handle_mock_bulk(next.as_ref(), shared, &mut run, buffer_size) {
                     break;
                 }
             }
@@ -676,6 +689,7 @@ pub(crate) mod mock {
         next: Option<&BulkRead>,
         shared: &StreamShared,
         run: &mut super::ErrorRun,
+        buffer_size: usize,
     ) -> bool {
         match next {
             Some(BulkRead::Fill(byte)) => {
@@ -704,7 +718,7 @@ pub(crate) mod mock {
             Some(BulkRead::Short(n)) => {
                 tracing::debug!(
                     bytes = n,
-                    expected = BUFFER_SIZE,
+                    expected = buffer_size,
                     "transient short bulk transfer; resubmitting"
                 );
                 super::record_transient(run)
