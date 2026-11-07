@@ -225,7 +225,7 @@ pub(crate) fn convert_block<'a>(
     if matches!(sample_type, SampleType::Raw) {
         // C sets the packed sample_count before the RAW branch skips
         // unpacking, so a packed RAW stream reports the unpacked
-        // count (174762 per full buffer), not bytes/2.
+        // count (98304 per 147456-byte packed buffer), not bytes/2.
         let count = if packing_enabled {
             unpacked_sample_count(bytes.len())
         } else {
