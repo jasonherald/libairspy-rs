@@ -9,6 +9,17 @@ by crates.io publishes of `libairspy-rs`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Packed (`-p 1`) captures now use the C transfer geometry.** The
+  streaming engine derives the bulk buffer size from the latched packing
+  flag — 262144 bytes unpacked, `6144 * 24` (147456) packed — and threads
+  it through the transfer pool, converter scratch, and delivered sample
+  counts, instead of hardcoding the unpacked geometry. Previously a
+  packed stream silently issued 262144-byte transfers yielding 174762
+  samples where the C library issues 147456-byte transfers yielding
+  98304. No API changes.
+
 ## [0.2.1] - 2026-09-20
 
 Driver refinements from the #74 review (deferred from 0.2.0 as issue #75).

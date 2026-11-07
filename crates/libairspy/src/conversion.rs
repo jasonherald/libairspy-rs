@@ -225,7 +225,7 @@ pub(crate) fn convert_block<'a>(
     if matches!(sample_type, SampleType::Raw) {
         // C sets the packed sample_count before the RAW branch skips
         // unpacking, so a packed RAW stream reports the unpacked
-        // count (174762 per full buffer), not bytes/2.
+        // count (98304 per 147456-byte packed buffer), not bytes/2.
         let count = if packing_enabled {
             unpacked_sample_count(bytes.len())
         } else {
@@ -421,11 +421,12 @@ mod tests {
 
     #[test]
     fn full_stream_buffer_matches_c_sample_count() {
-        // 262144-byte packed buffer → C's ((buffer_size/2)*4)/3 =
-        // 174762 samples, now reached without C's overrun.
-        let input = vec![0u8; 262_144];
-        let mut output = vec![0u16; 175_000];
-        assert_eq!(unpack_samples(&input, &mut output), 174_762);
+        // Packed full-stream buffer → C's ((buffer_size/2)*4)/3 with the
+        // packing-derived size (6144*24 = 147456 bytes) → 98304 samples,
+        // now reached without C's overrun.
+        let input = vec![0u8; 147_456];
+        let mut output = vec![0u16; 98_304];
+        assert_eq!(unpack_samples(&input, &mut output), 98_304);
     }
 
     #[test]
