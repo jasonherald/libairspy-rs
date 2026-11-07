@@ -305,7 +305,8 @@ mod tests {
         // Packed RAW: a continuous 12-bit stream uses every nibble, so a
         // substantial share of word-aligned reads land above the 12-bit
         // limit — this is what proves set_packing(true) took effect on
-        // the wire (block byte counts are identical in both modes).
+        // the wire (packed transfers now carry the smaller 6144*24-byte
+        // geometry, while unpacked ones carry the 262144-byte one).
         device.set_packing(true).expect("packing on");
         let (returned, packed) = capture_blocks(device, SampleType::Raw, SHORT_STREAM_BLOCKS);
         device = returned;

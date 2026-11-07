@@ -421,11 +421,12 @@ mod tests {
 
     #[test]
     fn full_stream_buffer_matches_c_sample_count() {
-        // 262144-byte packed buffer → C's ((buffer_size/2)*4)/3 =
-        // 174762 samples, now reached without C's overrun.
-        let input = vec![0u8; 262_144];
-        let mut output = vec![0u16; 175_000];
-        assert_eq!(unpack_samples(&input, &mut output), 174_762);
+        // Packed full-stream buffer → C's ((buffer_size/2)*4)/3 with the
+        // packing-derived size (6144*24 = 147456 bytes) → 98304 samples,
+        // now reached without C's overrun.
+        let input = vec![0u8; 147_456];
+        let mut output = vec![0u16; 98_304];
+        assert_eq!(unpack_samples(&input, &mut output), 98_304);
     }
 
     #[test]
